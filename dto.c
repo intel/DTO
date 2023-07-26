@@ -202,17 +202,13 @@ static enum {
 
 static unsigned int log_level = LOG_LEVEL_FATAL;
 
-/* Auto tuning variables */
-static atomic_ullong num_descs;
-static atomic_ullong adjust_num_descs;
-static atomic_ullong adjust_num_waits;
-static uint8_t auto_adjust_knobs = 1;
-
 /* Auto tune heuristics magic numbers */
 #define DESCS_PER_RUN 0xF0
 #define NUM_DESCS 16
-#define MIN_AVG_WAITS 1
-#define MAX_AVG_WAITS 2
+#define MIN_AVG_YIELD_WAITS 1.0
+#define MAX_AVG_YIELD_WAITS 2.0
+#define MIN_AVG_POLL_WAITS 5.0
+#define MAX_AVG_POLL_WAITS 20.0
 #define MAX_CPU_SIZE_FRACTION 0.9
 #define CSF_STEP_INCREMENT 0.01
 #define CSF_STEP_DECREMENT 0.01
@@ -220,6 +216,15 @@ static uint8_t auto_adjust_knobs = 1;
 #define MIN_DSA_MIN_SIZE 6144
 #define DMS_STEP_INCREMENT 1024
 #define DMS_STEP_DECREMENT 1024
+
+/* Auto tuning variables */
+static atomic_ullong num_descs;
+static atomic_ullong adjust_num_descs;
+static atomic_ullong adjust_num_waits;
+/* default waits are for yield because yield is default waiting method */
+static double min_avg_waits = MIN_AVG_YIELD_WAITS;
+static double max_avg_waits = MAX_AVG_YIELD_WAITS;
+static uint8_t auto_adjust_knobs = 1;
 
 static void dto_log(int req_log_level, const char *fmt, ...)
 {
@@ -331,15 +336,15 @@ static __always_inline void dsa_wait_no_adjust(const volatile uint8_t *comp)
  *     This minimizes the thread's wait time for DSA while maximizing DSA utilization
  *  Approximating the goal:
  *   - Threads waiting for DSA completion (e.g., by yielding), keep avg. no. of
- *     waits (i.e., yields) between MIN_AVG_WAITS and MAX_AVG_WAITS
+ *     waits (i.e., yields) between min_avg_waits and max_avg_waits
  *     (see local_num_waits variable below)
  * Heuristic
  *   1) Sample number of waits (local_num_waits) for NUM_DESCS descriptors
  *   every DESCS_PER_RUN descriptors
- *   2) If the avg. number of waits per descriptor > MAX_AVG_WAITS, decrease load on DSA
+ *   2) If the avg. number of waits per descriptor > max_avg_waits, decrease load on DSA
  *      - If cpu_size_fraction not too high, increase it by CSF_STEP_INCREMENT
  *      - else if dsa_min_size not too high, increase it by DMS_STEP_INCREMENT
- *   3) If the avg. number of waits per descriptor < MIN_AVG_WAITS, increase load on DSA
+ *   3) If the avg. number of waits per descriptor < min_avg_waits, increase load on DSA
  *      - If cpu_size_fraction not too low, decrease it by CSF_STEP_DECREMENT
  *      - else if dsa_min_size not too low, decrease it by DMS_STEP_DECREMENT
  */
@@ -369,12 +374,12 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp)
 			double avg_num_waits = (double)adjust_num_waits / temp;
 
 			adjust_num_waits = 0;
-			if (avg_num_waits > MAX_AVG_WAITS) {
+			if (avg_num_waits > max_avg_waits) {
 				if (cpu_size_fraction < MAX_CPU_SIZE_FRACTION)
 					cpu_size_fraction += CSF_STEP_INCREMENT;
 				else if (dsa_min_size < MAX_DSA_MIN_SIZE)
 					dsa_min_size += DMS_STEP_INCREMENT;
-			} else if (avg_num_waits < MIN_AVG_WAITS) {
+			} else if (avg_num_waits < min_avg_waits) {
 				if (cpu_size_fraction >= CSF_STEP_DECREMENT)
 					cpu_size_fraction -= CSF_STEP_DECREMENT;
 				else if (dsa_min_size > MIN_DSA_MIN_SIZE)
@@ -853,12 +858,17 @@ static int dsa_init(void)
 
 	env_str = getenv("DTO_WAIT_METHOD");
 	if (env_str != NULL) {
-		if (!strncmp(env_str, wait_names[WAIT_BUSYPOLL], strlen(wait_names[WAIT_BUSYPOLL])))
+		if (!strncmp(env_str, wait_names[WAIT_BUSYPOLL], strlen(wait_names[WAIT_BUSYPOLL]))) {
 			wait_method = WAIT_BUSYPOLL;
-		else if (!strncmp(env_str, wait_names[WAIT_UMWAIT], strlen(wait_names[WAIT_UMWAIT]))) {
-			if (umwait_support)
+			min_avg_waits = MIN_AVG_POLL_WAITS;
+			max_avg_waits = MAX_AVG_POLL_WAITS;
+		} else if (!strncmp(env_str, wait_names[WAIT_UMWAIT], strlen(wait_names[WAIT_UMWAIT]))) {
+			if (umwait_support) {
 				wait_method = WAIT_UMWAIT;
-			else
+				/* Use the same waits as busypoll for now */
+				min_avg_waits = MIN_AVG_POLL_WAITS;
+				max_avg_waits = MAX_AVG_POLL_WAITS;
+			} else
 				LOG_ERROR("umwait not supported. Falling back to default wait method\n");
 		}
 	}
