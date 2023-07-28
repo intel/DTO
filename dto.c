@@ -1117,6 +1117,17 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 	}
 }
 
+/* For overlapping src & dest buffers in memmove API, we can't split the memmove
+ * job. Otherwise, it may lead to incorrect copy operation.
+ */
+static bool is_overlapping_buffers (void *dest, const void *src, size_t n)
+{
+	if ((dest + n) < src || (src + n) < dest)
+		return false;
+
+	return true;
+}
+
 static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy, int *result)
 {
 	struct dto_wq *wq = get_wq();
@@ -1129,7 +1140,11 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
 
 	/* cpu_size_fraction gauranteed to be >= 0 and < 1 */
-	cpu_size = n * cpu_size_fraction;
+	if (!is_memcpy && is_overlapping_buffers(dest, src, n))
+		cpu_size = 0;
+	else
+		cpu_size = n * cpu_size_fraction;
+
 	dsa_size = n - cpu_size;
 
 	thr_bytes_completed = 0;
@@ -1161,7 +1176,11 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 
 			len = n <= threshold ? n : threshold;
 
-			cpu_size = len * fraction_snapshot;
+			if (!is_memcpy && is_overlapping_buffers(dest, src, len))
+				cpu_size = 0;
+			else
+				cpu_size = len * cpu_size_fraction;
+
 			dsa_size = len - cpu_size;
 
 			thr_desc.src_addr = (uint64_t) src + cpu_size + thr_bytes_completed;
