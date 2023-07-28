@@ -12,7 +12,7 @@ specified using an environment variable DTO_WQ_LIST.
 
 DTO library falls back to using standard APIs on CPU under following scenarios:
    a. DTO library is not able to find any DSA instances (e.g., not configured/provisioned)
-   b. Memory operation size is smaller than a offload threshold (configurable using an environment variable DTO_DSA_MIN_BYTES)
+   b. Memory operation size is smaller than a offload threshold (configurable using an environment variable DTO_MIN_BYTES)
    c. Not able to do work submission (e.g., reached ENQ retry threshold) due to WQ full
    d. DSA encounters a page-fault and completes partially (resulting in rest of the operation being completed using standard library on CPU)
 
