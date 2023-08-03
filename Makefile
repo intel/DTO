@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: MIT
 
-all: libdto dto-test dto-test-wodto
+all: libdto dto-test-wodto
 
 DML_LIB_CXX=-D_GNU_SOURCE
 

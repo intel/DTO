@@ -33,12 +33,12 @@ export DTO_AUTO_ADJUST_KNOBS=1
 #/usr/bin/time ./dto-test-wodto
 
 # Run dto-test with DTO library using LD_PRELOAD method
-#export LD_PRELOAD=./libdto.so.1.0
-#/usr/bin/time ./dto-test-wodto
+export LD_PRELOAD=./libdto.so.1.0
+/usr/bin/time ./dto-test-wodto
 
 # Run dto-test with DTO library using "re-compile with DTO" method
 # (i.e., without LD_PRELOAD)
-/usr/bin/time ./dto-test
+#/usr/bin/time ./dto-test
 
 # Run dto-test with DTO and get DSA perfmon counters
 #perf stat -e dsa0/event=0x1,event_category=0x0/,dsa2/event=0x1,event_category=0x0/,dsa4/event=0x1,event_category=0x0/,dsa6/event=0x1,event_category=0x0/,dsa0/event=0x1,event_category=0x1/,dsa2/event=0x1,event_category=0x1/,dsa4/event=0x1,event_category=0x1/,dsa6/event=0x1,event_category=0x1/,dsa0/event=0x2,event_category=0x1/,dsa2/event=0x2,event_category=0x1/,dsa4/event=0x2,event_category=0x1/,dsa6/event=0x2,event_category=0x1/ /usr/bin/time ./dto-test
