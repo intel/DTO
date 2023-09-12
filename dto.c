@@ -226,6 +226,8 @@ static double min_avg_waits = MIN_AVG_YIELD_WAITS;
 static double max_avg_waits = MAX_AVG_YIELD_WAITS;
 static uint8_t auto_adjust_knobs = 1;
 
+extern char *__progname;
+
 static void dto_log(int req_log_level, const char *fmt, ...)
 {
 	char buf[512];
@@ -900,7 +902,7 @@ static int init_dto(void)
 			/* ensure dto_log_path is null terminated */
 			dto_log_path[PATH_MAX - 1] = '\0';
 
-			snprintf(temp, sizeof(temp), ".%d", getpid());
+			snprintf(temp, sizeof(temp), ".%s.%d", __progname, getpid());
 			strncat(dto_log_path, temp, PATH_MAX - strlen(dto_log_path) - 1);
 
 			/* Open the log file only if it doesn't exist or if it is a regular file */
