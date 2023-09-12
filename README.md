@@ -52,6 +52,14 @@ Following environment variables control the behavior of DTO library:
 
 ## Build
 
+Pre-requisite packages:
+
+Should use glibc version 2.36 or later for best DTO performance. You can use "ldd --version" command to check glibc version on your system. glibc versions less than 2.36 have a bug which reduces DTO performance.
+
+On Fedora/CentOS/Rhel: kernel-headers, accel-config-devel, libuuid-devel
+
+On Ubuntu/Debian: linux-libc-dev, libaccel-config-dev, uuid-dev
+
 ```bash
 make libdto
 make install
@@ -68,7 +76,7 @@ make dto-test-wodto
 
 ## Test
 ```bash
-1. Make changes to test.sh or dto-4-dsa.conf to change DSA configuration if desired
+1. Make changes to test.sh or dto-4-dsa.conf to change DSA configuration if desired. test.sh configures DSA(s) using the config parameters in dto-4-dsa.conf
 2. Run the test.sh script to run the dto-test app (DTO linked using -ldto) or dto-test-wodto app (DTO linked using LD_PRELOAD).
 3. Using with other applications (two ways to use it)
     3a. Using "-ldto" linker option (requires recompiling the application)
