@@ -18,6 +18,7 @@
 #include <sys/stat.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <pthread.h>
 #include <dlfcn.h>
 #include <accel-config/libaccel_config.h>
 
@@ -83,6 +84,8 @@ static uint8_t use_std_lib_calls;
 static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
 static int wait_method = WAIT_YIELD;
 static double cpu_size_fraction;
+
+static uint8_t fork_handler_registered;
 
 enum memop {
 	MEMSET = 0x0,
@@ -184,7 +187,7 @@ static atomic_ullong lat_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
 static atomic_int fail_counter[HIST_NO_BUCKETS][MAX_FAILURES];
 #endif
 
-// call initialize/cleanup functions when library is loaded
+/* call initialize/cleanup functions when library is loaded/unloaded */
 static int init_dto(void) __attribute__((constructor));
 static void cleanup_dto(void) __attribute__((destructor));
 
@@ -244,6 +247,32 @@ static void dto_log(int req_log_level, const char *fmt, ...)
 		write(log_fd, buf, strlen(buf));
 	}
 	va_end(args);
+}
+
+/* Reinitialize DTO in the child process. */
+static void child (void)
+{
+#ifdef DTO_STATS_SUPPORT
+	int i, j, k;
+
+	/* Reset the counters */
+	for (i = 0; i < HIST_NO_BUCKETS; i++) {
+		for (j = 0; j < MAX_STAT_GROUP; j++) {
+			for (k = 0; k < MAX_MEMOP; k++) {
+				op_counter[i][j][k] = 0;
+				lat_counter[i][j][k] = 0;
+			}
+			bytes_counter[i][j] = 0;
+		}
+		for (j = 0; j < MAX_FAILURES; j++)
+			fail_counter[i][j] = 0;
+	}
+#endif
+	dto_initializing = 0;
+	dto_initialized = 0;
+	log_fd = -1;
+
+	init_dto();
 }
 
 static __always_inline inline unsigned char enqcmd(struct dsa_hw_desc *desc, volatile void *reg)
@@ -895,7 +924,7 @@ static int init_dto(void)
 
 		env_str = getenv("DTO_LOG_FILE");
 		if (env_str != NULL) {
-			char temp[16];
+			char temp[PATH_MAX];
 			struct stat st;
 
 			strncpy(dto_log_path, env_str, PATH_MAX - 1);
@@ -960,6 +989,22 @@ static int init_dto(void)
 			log_level = LOG_LEVEL_TRACE;
 		}
 #endif
+
+		/* Register fork handler for the child process */
+		if (!fork_handler_registered) {
+			/* If pthread_atfork fails, and process calls fork,
+			 * the child may crash when using DSA offload. Dont
+			 * take that risk and disable DSA offload for parent
+			 * as well.
+			 */
+			if (!pthread_atfork(NULL, NULL, child))
+				fork_handler_registered = 1;
+			else {
+				LOG_ERROR("Setting fork() handler failed. "
+					"Falling back to using CPUs.\n");
+				use_std_lib_calls = 1;
+			}
+		}
 
 		// initialize DSA
 		if (!use_std_lib_calls) {
