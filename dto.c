@@ -1372,11 +1372,12 @@ void *memset(void *s1, int c, size_t n)
 #endif
 
 	if (unlikely(dto_initialized == 0)) {
-		/* Use internal implementation while the
-		 * library is being initialized
+		/* If there are other constructors in the same binary,
+		 * they may run before DTO's constructor. Just use
+		 * internal CPU-based implementation if DTO is not
+		 * initialized yet.
 		 */
-		if (init_dto() == DTO_INITIALIZING)
-			return dto_internal_memset(s1, c, n);
+		return dto_internal_memset(s1, c, n);
 	}
 
 	if (!use_orig_func) {
@@ -1421,11 +1422,12 @@ void *memcpy(void *dest, const void *src, size_t n)
 #endif
 
 	if (unlikely(dto_initialized == 0)) {
-		/* Use internal implementation while the
-		 * library is being initialized
+		/* If there are other constructors in the same binary,
+		 * they may run before DTO's constructor. Just use
+		 * internal CPU-based implementation if DTO is not
+		 * initialized yet.
 		 */
-		if (init_dto() == DTO_INITIALIZING)
-			return dto_internal_memcpymove(dest, src, n);
+		return dto_internal_memcpymove(dest, src, n);
 	}
 
 	if (!use_orig_func) {
@@ -1473,11 +1475,12 @@ void *memmove(void *dest, const void *src, size_t n)
 #endif
 
 	if (unlikely(dto_initialized == 0)) {
-		/* Use internal implementation while the
-		 * library is being initialized
+		/* If there are other constructors in the same binary,
+		 * they may run before DTO's constructor. Just use
+		 * internal CPU-based implementation if DTO is not
+		 * initialized yet.
 		 */
-		if (init_dto() == DTO_INITIALIZING)
-			return dto_internal_memcpymove(dest, src, n);
+		return dto_internal_memcpymove(dest, src, n);
 	}
 
 	if (!use_orig_func) {
@@ -1525,11 +1528,12 @@ int memcmp(const void *s1, const void *s2, size_t n)
 #endif
 
 	if (unlikely(dto_initialized == 0)) {
-		/* Use internal implementation while the
-		 * library is being initialized
+		/* If there are other constructors in the same binary,
+		 * they may run before DTO's constructor. Just use
+		 * internal CPU-based implementation if DTO is not
+		 * initialized yet.
 		 */
-		if (init_dto() == DTO_INITIALIZING)
-			return dto_internal_memcmp(s1, s2, n);
+		return dto_internal_memcmp(s1, s2, n);
 	}
 
 	if (!use_orig_func) {
