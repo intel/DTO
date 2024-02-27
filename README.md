@@ -80,8 +80,8 @@ make dto-test-wodto
 2. Run the test.sh script to run the dto-test app (DTO linked using -ldto) or dto-test-wodto app (DTO linked using LD_PRELOAD).
 3. Using with other applications (two ways to use it)
     3a. Using "-ldto" linker option (requires recompiling the application)
-        i. Recompile the application with "-lto" linker options
-	ii. Setup DTO environment variables
+        i. Recompile the application with "-ldto" linker options
+	ii. Setup DTO environment variables (examples below)
             export DTO_USESTDC_CALLS=0
             export DTO_COLLECT_STATS=1
             export DTO_WAIT_METHOD=yield
