@@ -21,6 +21,8 @@
 #include <pthread.h>
 #include <dlfcn.h>
 #include <accel-config/libaccel_config.h>
+#include <numaif.h>
+#include <numa.h>
 
 #define likely(x)       __builtin_expect((x), 1)
 #define unlikely(x)     __builtin_expect((x), 0)
@@ -43,6 +45,8 @@
  * a hang (e.g., memset --> malloc --> alloc library calls memset --> memset)
  */
 #define MAX_WQS 16
+#define MAX_NUMA_NODES 16
+#define MAX_WQS_IN_DSA_DEVICE 8
 #define DTO_DEFAULT_MIN_SIZE 8192
 #define DTO_INITIALIZED 0
 #define DTO_INITIALIZING 1
@@ -68,6 +72,12 @@ struct dto_wq {
 	void *wq_portal;
 };
 
+struct dto_device {
+	struct dto_wq* wqs[MAX_WQS_IN_DSA_DEVICE];
+	uint8_t num_wqs;
+	atomic_uchar next_wq;
+};
+
 enum wait_options {
 	WAIT_BUSYPOLL = 0,
 	WAIT_UMWAIT,
@@ -76,11 +86,13 @@ enum wait_options {
 
 // global workqueue variables
 static struct dto_wq wqs[MAX_WQS];
+static struct dto_device* devices[MAX_NUMA_NODES];
 static uint8_t num_wqs;
-static uint8_t next_wq;
+static atomic_uchar next_wq;
 static uint8_t dto_initialized;
 static uint8_t dto_initializing;
 static uint8_t use_std_lib_calls;
+static uint8_t is_numa_aware;
 static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
 static int wait_method = WAIT_YIELD;
 static double cpu_size_fraction;
@@ -650,6 +662,36 @@ static unsigned long long dto_get_param_ullong(int dir_fd, char *path, int *err)
 	return val;
 }
 
+static void correct_devices_list() {
+/* 	Fill NULL gaps in devices list.
+	For SNC configurations there are less DSA devices then numa nodes
+	ex. SNC4: 8 numa nodes, 2 DSA devices:
+	dsa0 device has numa_node = 0, dsa2 device has numa_node = 4
+	Then we should use dsa0 device for numa_nodes = 0,1,2,3 and dsa2 device for numa_nodes = 4,5,6,7
+	and model the same in devices list.	
+ */	
+ 	struct dto_device* dev = NULL;
+	for (uint8_t i = 0; i < numa_num_configured_nodes(); i++) {
+		if (devices[i] != NULL) {
+			dev = devices[i];
+			continue;
+		} else {
+			devices[i] = dev;
+		}
+	}
+}
+
+static void cleanup_devices() {
+	struct dto_device* dev = NULL;
+	for (uint i = 0; i < MAX_NUMA_NODES; i++) {
+		if (devices[i] != dev) {
+			dev = devices[i];
+			free(devices[i]);
+		}
+		devices[i] = NULL;
+	}
+}
+ 
 static int dsa_init_from_wq_list(char *wq_list)
 {
 	char *wq;
@@ -680,10 +722,18 @@ static int dsa_init_from_wq_list(char *wq_list)
 		}
 
 		wqs[num_wqs].dsa_gencap = dto_get_param_ullong(dir_fd, "gen_cap", &rc);
-		close(dir_fd);
-
-		if (rc)
+		if (rc) {
+			close(dir_fd);
 			goto fail_wq;
+		}
+
+		const uint8_t dev_numa_node = (uint8_t)dto_get_param_ullong(dir_fd, "numa_node", &rc);
+		if (rc) {
+			close(dir_fd);
+			goto fail_wq;
+		}
+
+		close(dir_fd);
 
 		snprintf(file_path, PATH_MAX, "/sys/bus/dsa/devices/%s", wq);
 
@@ -735,6 +785,17 @@ static int dsa_init_from_wq_list(char *wq_list)
 			goto fail_wq;
 		}
 
+		if (is_numa_aware) {
+			struct dto_device* dev = devices[dev_numa_node] == NULL ? calloc(1, sizeof(struct dto_device)) : devices[dev_numa_node];
+			if (dev != NULL && 
+				dev->num_wqs < MAX_WQS_IN_DSA_DEVICE) {
+					if (dev->num_wqs == 0) {
+						devices[dev_numa_node] = dev;
+					}
+					dev->wqs[dev->num_wqs++] = &wqs[num_wqs];
+			}
+		}
+
 		++num_wqs;
 		if (num_wqs == MAX_WQS)
 			break;
@@ -746,12 +807,20 @@ static int dsa_init_from_wq_list(char *wq_list)
 		rc = -EINVAL;
 		goto fail;
 	}
+
+	if (is_numa_aware) {
+		correct_devices_list();
+	}
+
 	return 0;
 
 fail_wq:
 	for (int j = 0; j < num_wqs; j++)
 		munmap(wqs[j].wq_portal, 0x1000);
 	num_wqs = 0;
+
+	cleanup_devices();
+
 fail:
 	return rc;
 }
@@ -776,7 +845,11 @@ static int dsa_init_from_accfg(void)
 	num_wqs = 0;
 
 	accfg_device_foreach(dto_ctx, device) {
-		enum accfg_device_state dstate;
+		enum accfg_device_state dstate;		
+
+    	/* use dsa devices only*/
+		if (strncmp(accfg_device_get_devname(device), "dsa", 3)!= 0)
+			continue;
 
 		/* Make sure that the device is enabled */
 		dstate = accfg_device_get_state(device);
@@ -789,6 +862,14 @@ static int dsa_init_from_accfg(void)
 				break;
 		if (i != num_wqs)
 			continue;
+
+		struct dto_device* dev = NULL;
+		uint8_t dev_numa_node = 0;
+
+		if (is_numa_aware) {
+			dev = calloc(1, sizeof(struct dto_device));
+			dev_numa_node = accfg_device_get_numa_node(device);
+		}
 
 		accfg_wq_foreach(device, wq) {
 			enum accfg_wq_state wstate;
@@ -818,9 +899,20 @@ static int dsa_init_from_accfg(void)
 
 			used_devids[num_wqs] = accfg_device_get_id(device);
 
+			if (is_numa_aware && 
+				dev->num_wqs < MAX_WQS_IN_DSA_DEVICE && 
+				dev != NULL) {
+				dev->wqs[dev->num_wqs++] = &wqs[num_wqs];
+			}
+
 			num_wqs++;
-			break;
+			// break;
 		}
+
+		if (is_numa_aware) {
+			devices[dev_numa_node] = dev;
+		}
+
 		if (num_wqs == MAX_WQS)
 			break;
 	}
@@ -858,6 +950,10 @@ static int dsa_init_from_accfg(void)
 		}
 	}
 
+	if (is_numa_aware) {
+		correct_devices_list();
+	}
+
 	accfg_unref(dto_ctx);
 	return 0;
 
@@ -865,6 +961,8 @@ fail_wq:
 	for (int j = 0; j < i; j++)
 		munmap(wqs[j].wq_portal, 0x1000);
 	num_wqs = 0;
+
+	cleanup_devices();
 fail:
 	accfg_unref(dto_ctx);
 	return rc;
@@ -970,6 +1068,17 @@ static int init_dto(void)
 			use_std_lib_calls = !!use_std_lib_calls;
 		}
 
+		env_str = getenv("DTO_IS_NUMA_AWARE");
+		if (env_str != NULL) {
+			errno = 0;
+			is_numa_aware = strtoul(env_str, NULL, 10);
+			if (errno)
+				is_numa_aware = 0;
+
+			is_numa_aware = !!is_numa_aware &&
+							numa_available() != -1;
+		}
+
 #ifdef DTO_STATS_SUPPORT
 		env_str = getenv("DTO_COLLECT_STATS");
 		if (env_str != NULL) {
@@ -1053,9 +1162,9 @@ static int init_dto(void)
 
 			// display configuration
 			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
-				"cpu_size_fraction: %.2f wait_method: %s, auto_adjust_knobs %d\n",
+				"cpu_size_fraction: %.2f wait_method: %s, auto_adjust_knobs: %d, is_numa_aware: %d\n",
 				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
-				cpu_size_fraction, wait_names[wait_method], auto_adjust_knobs);
+				cpu_size_fraction, wait_names[wait_method], auto_adjust_knobs, is_numa_aware);
 			for (int i = 0; i < num_wqs; i++)
 				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx\n", i,
 					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap);
@@ -1080,23 +1189,43 @@ static void cleanup_dto(void)
 #endif
 	if (log_fd != -1)
 		close(log_fd);
+	
+	cleanup_devices();
 }
 
-static __always_inline  struct dto_wq *get_wq(void)
+static __always_inline  struct dto_wq *get_wq(void* buf)
 {
-	/* No need to have strict round robin wq usage
-	 * in order to avoid using locked instructions
-	 */
-	int wq_idx = next_wq++ % num_wqs;
+	struct dto_wq* wq = NULL;
 
-	return &wqs[wq_idx];
+	if (is_numa_aware &&
+		buf != NULL) {
+		int status[1] = {-1};
+
+		// get numa node of memory pointed by buf
+		if (move_pages(0, 1, &buf, NULL, status, 0) == 0) {
+			int buf_numa_node = status[0];
+			if (buf_numa_node < MAX_NUMA_NODES) {
+				struct dto_device* dev = devices[buf_numa_node];
+				if (dev != NULL && 
+					dev->num_wqs > 0) {
+					wq = dev->wqs[dev->next_wq++ % dev->num_wqs];
+				}			
+			}
+		}
+	}
+
+	if (wq == NULL) {
+		wq = &wqs[next_wq++ % num_wqs];
+	}
+	
+	return wq;
 }
 
 static void dto_memset(void *s, int c, size_t n, int *result)
 {
 	uint64_t memset_pattern;
 	size_t cpu_size, dsa_size;
-	struct dto_wq *wq = get_wq();
+	struct dto_wq *wq = get_wq(s);
 
 	for (int i = 0; i < 8; ++i)
 		((uint8_t *) &memset_pattern)[i] = (uint8_t) c;
@@ -1177,7 +1306,7 @@ static bool is_overlapping_buffers (void *dest, const void *src, size_t n)
 
 static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy, int *result)
 {
-	struct dto_wq *wq = get_wq();
+	struct dto_wq *wq = get_wq(dest);
 	size_t cpu_size, dsa_size;
 
 	thr_desc.opcode = DSA_OPCODE_MEMMOVE;
@@ -1262,7 +1391,7 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 
 static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
 {
-	struct dto_wq *wq = get_wq();
+	struct dto_wq *wq = get_wq((void*)s2);
 	int cmp_result = 0;
 	size_t orig_n = n;
 
