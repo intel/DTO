@@ -89,8 +89,8 @@ static struct dto_wq wqs[MAX_WQS];
 static struct dto_device* devices[MAX_NUMA_NODES];
 static uint8_t num_wqs;
 static atomic_uchar next_wq;
-static uint8_t dto_initialized;
-static uint8_t dto_initializing;
+static atomic_uchar dto_initialized;
+static atomic_uchar dto_initializing;
 static uint8_t use_std_lib_calls;
 static uint8_t is_numa_aware;
 static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
@@ -287,7 +287,7 @@ static void child (void)
 	init_dto();
 }
 
-static __always_inline inline unsigned char enqcmd(struct dsa_hw_desc *desc, volatile void *reg)
+static __always_inline unsigned char enqcmd(struct dsa_hw_desc *desc, volatile void *reg)
 {
 	unsigned char retry;
 
@@ -297,18 +297,18 @@ static __always_inline inline unsigned char enqcmd(struct dsa_hw_desc *desc, vol
 	return retry;
 }
 
-static __always_inline inline void movdir64b(struct dsa_hw_desc *desc, volatile void *reg)
+static __always_inline void movdir64b(struct dsa_hw_desc *desc, volatile void *reg)
 {
 	asm volatile(".byte 0x66, 0x0f, 0x38, 0xf8, 0x02\t\n"
 		: : "a" (reg), "d" (desc));
 }
 
-static __always_inline inline void umonitor(const volatile void *addr)
+static __always_inline void umonitor(const volatile void *addr)
 {
 	asm volatile(".byte 0xf3, 0x48, 0x0f, 0xae, 0xf0" : : "a"(addr));
 }
 
-static __always_inline inline int umwait(unsigned long timeout, unsigned int state)
+static __always_inline int umwait(unsigned long timeout, unsigned int state)
 {
 	uint8_t r;
 	uint32_t timeout_low = (uint32_t)timeout;
@@ -411,7 +411,7 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp)
 	adjust_num_waits += local_num_waits;
 
 	if (adjust_num_descs >= NUM_DESCS) {
-		atomic_ullong temp = adjust_num_descs;
+		unsigned long long temp = adjust_num_descs;
 
 		if (temp && atomic_compare_exchange_strong(&adjust_num_descs, &temp, 0)) {
 			double avg_num_waits = (double)adjust_num_waits / temp;
