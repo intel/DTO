@@ -752,10 +752,14 @@ static int dsa_init_from_wq_list(char *wq_list)
 
 		dto_get_param_string(dir_fd, "mode", wq_mode);
 
-		if (strcmp(wq_mode, "dedicated") == 0) {
+        if (wq_mode[0] == '\0') {
 			close(dir_fd);
 			rc = -ENOTSUP;
-			goto fail_wq;
+			goto fail_wq;			
+		}
+
+		if (strcmp(wq_mode, "shared") != 0) {
+			continue;
 		}
 
 		wqs[num_wqs].wq_size = dto_get_param_ullong(dir_fd, "size", &rc);
