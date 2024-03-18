@@ -20,8 +20,8 @@ To improve throughput for synchronous offload, DTO uses "pseudo asynchronous" ex
 1) After intercepting the API call, DTO splits the API job into two parts; 1) CPU job and 2) DSA job. For example, a 64 KB memcpy may
    be split into 20 KB CPU job and 44 KB DSA job. The split fraction can be configured using an environment variable DTO_CPU_SIZE_FRACTION. 
 2) DTO submits the DSA portion of the job to DSA. 
-   If DTO_IS_NUMA_AWARE=1 DTO uses works queues of DSA device located on the same numa node as 
-   buffer (memcpy/memmove - dest buffer, memcmp - ptr2) delivered to method. This reduces UPI traffic.
+   If DTO_IS_NUMA_AWARE=1 DTO uses work queues of DSA device located on the same numa node as 
+   buffer (memcpy/memmove - dest buffer, memcmp - ptr2) delivered to method. This reduces cross-socket traffic.
 3) In parallel, DTO performs the CPU portion of the job using std library on CPU.
 4) DTO waits for DSA to complete (if it hasn't completed already). The wait method can be configured using an environment variable DTO_WAIT_METHOD.
 
