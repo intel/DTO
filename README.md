@@ -59,9 +59,9 @@ Pre-requisite packages:
 
 Should use glibc version 2.36 or later for best DTO performance. You can use "ldd --version" command to check glibc version on your system. glibc versions less than 2.36 have a bug which reduces DTO performance.
 
-On Fedora/CentOS/Rhel: kernel-headers, accel-config-devel, libuuid-devel
+On Fedora/CentOS/Rhel: kernel-headers, accel-config-devel, libuuid-devel, libnuma-devel
 
-On Ubuntu/Debian: linux-libc-dev, libaccel-config-dev, uuid-dev
+On Ubuntu/Debian: linux-libc-dev, libaccel-config-dev, uuid-dev, libnuma-dev
 
 ```bash
 make libdto
