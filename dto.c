@@ -239,6 +239,7 @@ static atomic_ullong adjust_num_waits;
 static double min_avg_waits = MIN_AVG_YIELD_WAITS;
 static double max_avg_waits = MAX_AVG_YIELD_WAITS;
 static uint8_t auto_adjust_knobs = 1;
+static uint8_t dsa_mode = 0; // 0: shared, 1: dedicated
 
 extern char *__progname;
 
@@ -453,44 +454,70 @@ static __always_inline int dsa_wait(struct dto_wq *wq,
 static __always_inline int dsa_submit(struct dto_wq *wq,
 	struct dsa_hw_desc *hw)
 {
-	int retry;
 	//LOG_TRACE("desc flags: 0x%x, opcode: 0x%x\n", hw->flags, hw->opcode);
 	__builtin_ia32_sfence();
-	for (int r = 0; r < ENQCMD_MAX_RETRIES; ++r) {
-		retry = enqcmd(hw, wq->wq_portal);
-		if (!retry)
+	switch (dsa_mode) {
+		case 0: { //shared
+			int retry;
+			for (int r = 0; r < ENQCMD_MAX_RETRIES; ++r) {
+				retry = enqcmd(hw, wq->wq_portal);
+				if (!retry)
+					return SUCCESS;
+			}
+			return RETRIES;
+		}
+		case 1: { //dedicated
+			movdir64b(hw, wq->wq_portal);
 			return SUCCESS;
+		} 
 	}
-	return RETRIES;
+	return FAIL_OTHERS;
 }
 
 static __always_inline int dsa_execute(struct dto_wq *wq,
 	struct dsa_hw_desc *hw, volatile uint8_t *comp)
 {
-	int retry;
 	*comp = 0;
+	bool do_wait = false;
 	//LOG_TRACE("desc flags: 0x%x, opcode: 0x%x\n", hw->flags, hw->opcode);
 	__builtin_ia32_sfence();
-	for (int r = 0; r < ENQCMD_MAX_RETRIES; ++r) {
-		retry = enqcmd(hw, wq->wq_portal);
-		if (!retry) {
-			if (auto_adjust_knobs)
-				dsa_wait_and_adjust(comp);
-			else
-				dsa_wait_no_adjust(comp);
-
-			if (*comp == DSA_COMP_SUCCESS) {
-				thr_bytes_completed += hw->xfer_size;
-				return SUCCESS;
-			} else if ((*comp & DSA_COMP_STATUS_MASK) == DSA_COMP_PAGE_FAULT_NOBOF) {
-				thr_bytes_completed += thr_comp.bytes_completed;
-				return PAGE_FAULT;
+	switch (dsa_mode) {
+		case 0: { //shared
+			int retry;
+			for (int r = 0; r < ENQCMD_MAX_RETRIES; ++r) {
+				retry = enqcmd(hw, wq->wq_portal);
+				if (!retry) {
+					do_wait = true;
+					break;
+				}
 			}
-			LOG_ERROR("failed status %x xfersz %x\n", *comp, hw->xfer_size);
-			return FAIL_OTHERS;
+			if (!do_wait)
+				return RETRIES;
+		}
+		case 1: { //dedicated
+			movdir64b(hw, wq->wq_portal);
+			do_wait = true;
 		}
 	}
-	return RETRIES;
+
+	if (do_wait) {
+		if (auto_adjust_knobs)
+			dsa_wait_and_adjust(comp);
+		else
+			dsa_wait_no_adjust(comp);
+
+		if (*comp == DSA_COMP_SUCCESS) {
+			thr_bytes_completed += hw->xfer_size;
+			return SUCCESS;
+		} else if ((*comp & DSA_COMP_STATUS_MASK) == DSA_COMP_PAGE_FAULT_NOBOF) {
+			thr_bytes_completed += thr_comp.bytes_completed;
+			return PAGE_FAULT;
+		}
+		LOG_ERROR("failed status %x xfersz %x\n", *comp, hw->xfer_size);
+		return FAIL_OTHERS;
+	}
+
+	return FAIL_OTHERS;
 }
 
 #ifdef DTO_STATS_SUPPORT
@@ -769,7 +796,8 @@ static int dsa_init_from_wq_list(char *wq_list)
 			goto fail_wq;			
 		}
 
-		if (strcmp(wq_mode, "shared") != 0) {
+		if ((dsa_mode == 0 && strcmp(wq_mode, "shared") != 0) || 
+		    (dsa_mode == 1 && strcmp(wq_mode, "dedicated") != 0)) {
 			continue;
 		}
 
@@ -899,7 +927,8 @@ static int dsa_init_from_accfg(void)
 
 			/* the wq mode should be shared work queue */
 			mode = accfg_wq_get_mode(wq);
-			if (mode != ACCFG_WQ_SHARED)
+			if ((dsa_mode == 0 && mode == ACCFG_WQ_DEDICATED) ||
+			    (dsa_mode == 1 && mode == ACCFG_WQ_SHARED))
 				continue;
 
 			wqs[num_wqs].wq_size = accfg_wq_get_size(wq);
@@ -1074,17 +1103,6 @@ static int init_dto(void)
 			use_std_lib_calls = !!use_std_lib_calls;
 		}
 
-		env_str = getenv("DTO_IS_NUMA_AWARE");
-		if (env_str != NULL) {
-			errno = 0;
-			is_numa_aware = strtoul(env_str, NULL, 10);
-			if (errno)
-				is_numa_aware = 0;
-
-			is_numa_aware = !!is_numa_aware &&
-							numa_available() != -1;
-		}
-
 #ifdef DTO_STATS_SUPPORT
 		env_str = getenv("DTO_COLLECT_STATS");
 		if (env_str != NULL) {
@@ -1161,6 +1179,26 @@ static int init_dto(void)
 				auto_adjust_knobs = !!auto_adjust_knobs;
 			}
 
+			env_str = getenv("DTO_IS_NUMA_AWARE");
+			if (env_str != NULL) {
+				errno = 0;
+				is_numa_aware = strtoul(env_str, NULL, 10);
+				if (errno)
+					is_numa_aware = 0;
+
+				is_numa_aware = !!is_numa_aware && numa_available() != -1;
+			}
+
+			env_str = getenv("DTO_DSA_MODE");
+			if (env_str != NULL) {
+				errno = 0;
+				dsa_mode = strtoul(env_str, NULL, 10);
+				if (errno)
+					dsa_mode = 0;
+
+				dsa_mode = !!dsa_mode;
+			}
+
 			if (dsa_init()) {
 				LOG_ERROR("Didn't find any usable DSAs. Falling back to using CPUs.\n");
 				use_std_lib_calls = 1;
@@ -1168,9 +1206,9 @@ static int init_dto(void)
 
 			// display configuration
 			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
-				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, is_numa_aware: %d\n",
+				"cpu_size_fraction: %.2f wait_method: %s, auto_adjust_knobs: %d, is_numa_aware: %d, dsa_mode: %s\n",
 				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
-				cpu_size_fraction, wait_names[wait_method], auto_adjust_knobs, is_numa_aware);
+				cpu_size_fraction, wait_names[wait_method], auto_adjust_knobs, is_numa_aware, dsa_mode == 0 ? "shared" : "dedicated");
 			for (int i = 0; i < num_wqs; i++)
 				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx\n", i,
 					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap);

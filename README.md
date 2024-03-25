@@ -47,7 +47,8 @@ Following environment variables control the behavior of DTO library:
 	DTO_CPU_SIZE_FRACTION=0.xx (specifies fraction of job performed by CPU, in parallel to DSA). Default is 0.00
 	DTO_AUTO_ADJUST_KNOBS=0/1 (disables/enables auto tuning of cpu_size_fraction and dsa_min_bytes parameters. 0 -- disable, 1 -- enable (default))
    DTO_IS_NUMA_AWARE=0/1 (disables/enables numa awareness. 0 -- disable (default), 1 -- enable)
-	DTO_WQ_LIST="semi-colon(;) separated list of DSA WQs to use". The WQ names should match their names in /dev/dsa/ directory (see example below).
+   DTO_DSA_MODE=0/1 (shared/dedicated uses shared/dedicated DSA mode, 0 -- shared (default), 1 -- dedicated)
+   DTO_WQ_LIST="semi-colon(;) separated list of DSA WQs to use". The WQ names should match their names in /dev/dsa/ directory (see example below).
 				If not specified, DTO will try to auto-discover and use all available WQs.
 	DTO_LOG_FILE=<dto log file path> Redirect the DTO output to the specified file instead of std output (useful for debugging and statistics collection). file name is suffixed by process pid.
 	DTO_LOG_LEVEL=0/1/2 controls the log level. higher value means more verbose logging (default 0).
