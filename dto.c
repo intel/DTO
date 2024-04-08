@@ -92,8 +92,8 @@ enum numa_aware {
 
 static const char * const numa_aware_names[] = {
 	[NA_NONE] = "none",
-	[NA_BUFFER_CENTRIC] = "buffer centric",
-	[NA_CPU_CENTRIC] = "cpu centric",
+	[NA_BUFFER_CENTRIC] = "buffer-centric",
+	[NA_CPU_CENTRIC] = "cpu-centric"
 };
 
 // global workqueue variables
