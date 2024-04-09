@@ -724,6 +724,8 @@ static __always_inline  int get_numa_node(void* buf) {
 				// if (get_mempolicy(&numa_node, NULL, 0, (void *)buf, MPOL_F_NODE | MPOL_F_ADDR) != 0) {
 				// 	LOG_ERROR("get_mempolicy call error: %d - %s", errno, strerror(errno));
 				// }
+			} else {
+				LOG_ERROR("NULL buffer delivered. Unable to detect numa node");
 			}
 		}
 		break;
@@ -1255,8 +1257,7 @@ static __always_inline  struct dto_wq *get_wq(void* buf)
 {
 	struct dto_wq* wq = NULL;
 
-	if (is_numa_aware &&
-		buf != NULL) {
+	if (is_numa_aware) {
 		int status[1] = {-1};
 
 		// get the numa node for the target DSA device
