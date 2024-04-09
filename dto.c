@@ -1259,7 +1259,7 @@ static __always_inline  struct dto_wq *get_wq(void* buf)
 		buf != NULL) {
 		int status[1] = {-1};
 
-		// get numa node of memory pointed by buf
+		// get the numa node for the target DSA device
 		const int numa_node = get_numa_node(buf);
 		if (numa_node >= 0 && numa_node < MAX_NUMA_NODES) {
 			struct dto_device* dev = devices[numa_node];
