@@ -96,6 +96,16 @@ static const char * const numa_aware_names[] = {
 	[NA_CPU_CENTRIC] = "cpu-centric"
 };
 
+enum dsa_mode {
+	DM_SHARED = 0,
+	DM_DEDICATED
+};
+
+static const char * const dsa_mode_names[] = {
+	[DM_SHARED] = "shared",
+	[DM_DEDICATED] = "dedicated"
+};
+
 // global workqueue variables
 static struct dto_wq wqs[MAX_WQS];
 static struct dto_device* devices[MAX_NUMA_NODES];
@@ -252,7 +262,7 @@ static atomic_ullong adjust_num_waits;
 static double min_avg_waits = MIN_AVG_YIELD_WAITS;
 static double max_avg_waits = MAX_AVG_YIELD_WAITS;
 static uint8_t auto_adjust_knobs = 1;
-static uint8_t dsa_mode = 0; // 0: shared, 1: dedicated
+static enum dsa_mode dsa_mode = DM_SHARED; 
 
 extern char *__progname;
 
@@ -470,7 +480,7 @@ static __always_inline int dsa_submit(struct dto_wq *wq,
 	//LOG_TRACE("desc flags: 0x%x, opcode: 0x%x\n", hw->flags, hw->opcode);
 	__builtin_ia32_sfence();
 	switch (dsa_mode) {
-		case 0: { //shared
+		case DM_SHARED: {
 			int retry;
 			for (int r = 0; r < ENQCMD_MAX_RETRIES; ++r) {
 				retry = enqcmd(hw, wq->wq_portal);
@@ -479,7 +489,7 @@ static __always_inline int dsa_submit(struct dto_wq *wq,
 			}
 			return RETRIES;
 		}
-		case 1: { //dedicated
+		case DM_DEDICATED: {
 			movdir64b(hw, wq->wq_portal);
 			return SUCCESS;
 		} 
@@ -495,7 +505,7 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
 	//LOG_TRACE("desc flags: 0x%x, opcode: 0x%x\n", hw->flags, hw->opcode);
 	__builtin_ia32_sfence();
 	switch (dsa_mode) {
-		case 0: { //shared
+		case DM_SHARED: {
 			int retry;
 			for (int r = 0; r < ENQCMD_MAX_RETRIES; ++r) {
 				retry = enqcmd(hw, wq->wq_portal);
@@ -507,7 +517,7 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
 			if (!do_wait)
 				return RETRIES;
 		}
-		case 1: { //dedicated
+		case DM_DEDICATED: {
 			movdir64b(hw, wq->wq_portal);
 			do_wait = true;
 		}
@@ -848,8 +858,8 @@ static int dsa_init_from_wq_list(char *wq_list)
 			goto fail_wq;			
 		}
 
-		if ((dsa_mode == 0 && strcmp(wq_mode, "shared") != 0) || 
-		    (dsa_mode == 1 && strcmp(wq_mode, "dedicated") != 0)) {
+		if ((dsa_mode == DM_SHARED && strcmp(wq_mode, "shared") != 0) || 
+		    (dsa_mode == DM_DEDICATED && strcmp(wq_mode, "dedicated") != 0)) {
 			continue;
 		}
 
@@ -979,8 +989,8 @@ static int dsa_init_from_accfg(void)
 
 			/* the wq mode should be shared work queue */
 			mode = accfg_wq_get_mode(wq);
-			if ((dsa_mode == 0 && mode == ACCFG_WQ_DEDICATED) ||
-			    (dsa_mode == 1 && mode == ACCFG_WQ_SHARED))
+			if ((dsa_mode == DM_SHARED && mode != ACCFG_WQ_SHARED) ||
+			    (dsa_mode == DM_DEDICATED && mode != ACCFG_WQ_DEDICATED))
 				continue;
 
 			wqs[num_wqs].wq_size = accfg_wq_get_size(wq);
@@ -1246,10 +1256,8 @@ static int init_dto(void)
 			if (env_str != NULL) {
 				errno = 0;
 				dsa_mode = strtoul(env_str, NULL, 10);
-				if (errno)
-					dsa_mode = 0;
-
-				dsa_mode = !!dsa_mode;
+				if (errno || dsa_mode > DM_DEDICATED)
+					dsa_mode = DM_SHARED;
 			}
 
 			if (dsa_init()) {
@@ -1261,7 +1269,7 @@ static int init_dto(void)
 			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
 				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dsa_mode: %s\n",
 				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
-				cpu_size_fraction, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dsa_mode == 0 ? "shared" : "dedicated");
+				cpu_size_fraction, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dsa_mode_names[dsa_mode]);
 			for (int i = 0; i < num_wqs; i++)
 				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx\n", i,
 					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap);
