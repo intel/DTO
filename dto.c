@@ -1220,7 +1220,7 @@ static int init_dto(void)
 
 			// display configuration
 			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
-				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, is_numa_aware: %s\n",
+				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s\n",
 				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
 				cpu_size_fraction, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware]);
 			for (int i = 0; i < num_wqs; i++)
