@@ -83,6 +83,19 @@ enum wait_options {
 	WAIT_YIELD
 };
 
+enum numa_aware {
+	NA_NONE = 0,
+	NA_BUFFER_CENTRIC,
+	NA_CPU_CENTRIC,
+	NA_LAST_ENTRY
+};
+
+static const char * const numa_aware_names[] = {
+	[NA_NONE] = "none",
+	[NA_BUFFER_CENTRIC] = "buffer-centric",
+	[NA_CPU_CENTRIC] = "cpu-centric"
+};
+
 // global workqueue variables
 static struct dto_wq wqs[MAX_WQS];
 static struct dto_device* devices[MAX_NUMA_NODES];
@@ -91,7 +104,7 @@ static atomic_uchar next_wq;
 static atomic_uchar dto_initialized;
 static atomic_uchar dto_initializing;
 static uint8_t use_std_lib_calls;
-static uint8_t is_numa_aware;
+static enum numa_aware is_numa_aware;
 static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
 static int wait_method = WAIT_YIELD;
 static double cpu_size_fraction;
@@ -719,6 +732,45 @@ static void correct_devices_list() {
 	}
 }
 
+static __always_inline  int get_numa_node(void* buf) {
+	int numa_node = -1;
+	
+	switch (is_numa_aware) {
+        case NA_BUFFER_CENTRIC: {
+			if (buf != NULL) {
+				int status[1] = {-1};
+
+				// get numa node of memory pointed by buf
+				if (move_pages(0, 1, &buf, NULL, status, 0) == 0) {
+					numa_node = status[0];	
+				} else {
+					LOG_ERROR("move_pages call error: %d - %s", errno, strerror(errno));
+				}
+
+				// alternatively get_mempolicy can be used
+				// if (get_mempolicy(&numa_node, NULL, 0, (void *)buf, MPOL_F_NODE | MPOL_F_ADDR) != 0) {
+				// 	LOG_ERROR("get_mempolicy call error: %d - %s", errno, strerror(errno));
+				// }
+			}
+		}
+		break;
+		case NA_CPU_CENTRIC: {
+			const int cpu = sched_getcpu();
+			if (cpu != -1) {
+				numa_node = numa_node_of_cpu(sched_getcpu());
+			}
+			else {
+				LOG_ERROR("sched_getcpu call error: %d - %s", errno, strerror(errno));
+			}
+		}
+		break;
+        default:
+		break;
+        }
+
+        return numa_node;
+}
+
 static void cleanup_devices() {
 	struct dto_device* dev = NULL;
 	for (uint i = 0; i < MAX_NUMA_NODES; i++) {
@@ -1179,14 +1231,15 @@ static int init_dto(void)
 				auto_adjust_knobs = !!auto_adjust_knobs;
 			}
 
-			env_str = getenv("DTO_IS_NUMA_AWARE");
-			if (env_str != NULL) {
-				errno = 0;
-				is_numa_aware = strtoul(env_str, NULL, 10);
-				if (errno)
-					is_numa_aware = 0;
-
-				is_numa_aware = !!is_numa_aware && numa_available() != -1;
+			if (numa_available() != -1) {
+				env_str = getenv("DTO_IS_NUMA_AWARE");
+				if (env_str != NULL) {
+					errno = 0;
+					is_numa_aware = strtoul(env_str, NULL, 10);
+					if (errno || is_numa_aware >= NA_LAST_ENTRY) {
+						is_numa_aware = NA_NONE;
+					}
+				}
 			}
 
 			env_str = getenv("DTO_DSA_MODE");
@@ -1206,9 +1259,9 @@ static int init_dto(void)
 
 			// display configuration
 			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
-				"cpu_size_fraction: %.2f wait_method: %s, auto_adjust_knobs: %d, is_numa_aware: %d, dsa_mode: %s\n",
+				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, is_numa_aware: %s, dsa_mode: %s\n",
 				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
-				cpu_size_fraction, wait_names[wait_method], auto_adjust_knobs, is_numa_aware, dsa_mode == 0 ? "shared" : "dedicated");
+				cpu_size_fraction, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dsa_mode == 0 ? "shared" : "dedicated");
 			for (int i = 0; i < num_wqs; i++)
 				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx\n", i,
 					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap);
@@ -1245,16 +1298,14 @@ static __always_inline  struct dto_wq *get_wq(void* buf)
 		buf != NULL) {
 		int status[1] = {-1};
 
-		// get numa node of memory pointed by buf
-		if (move_pages(0, 1, &buf, NULL, status, 0) == 0) {
-			int buf_numa_node = status[0];
-			if (buf_numa_node < MAX_NUMA_NODES) {
-				struct dto_device* dev = devices[buf_numa_node];
-				if (dev != NULL && 
-					dev->num_wqs > 0) {
-					wq = dev->wqs[dev->next_wq++ % dev->num_wqs];
-				}			
-			}
+		// get the numa node for the target DSA device
+		const int numa_node = get_numa_node(buf);
+		if (numa_node >= 0 && numa_node < MAX_NUMA_NODES) {
+			struct dto_device* dev = devices[numa_node];
+			if (dev != NULL && 
+				dev->num_wqs > 0) {
+				wq = dev->wqs[dev->next_wq++ % dev->num_wqs];
+			}			
 		}
 	}
 
