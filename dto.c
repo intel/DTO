@@ -693,9 +693,9 @@ static void correct_devices_list() {
 	ex. SNC4: 8 numa nodes, 2 DSA devices:
 	dsa0 device has numa_node = 0, dsa2 device has numa_node = 4
 	Then we should use dsa0 device for numa_nodes = 0,1,2,3 and dsa2 device for numa_nodes = 4,5,6,7
-	and model the same in devices list.	
- */	
- 	struct dto_device* dev = NULL;
+	and model the same in devices list.
+ */
+	struct dto_device* dev = NULL;
 	for (uint8_t i = 0; i < MAX_NUMA_NODES; i++) {
 		if (devices[i] != NULL) {
 			dev = devices[i];
@@ -707,7 +707,7 @@ static void correct_devices_list() {
 
 static __always_inline  int get_numa_node(void* buf) {
 	int numa_node = -1;
-	
+
 	switch (is_numa_aware) {
         case NA_BUFFER_CENTRIC: {
 			if (buf != NULL) {
@@ -715,7 +715,7 @@ static __always_inline  int get_numa_node(void* buf) {
 
 				// get numa node of memory pointed by buf
 				if (move_pages(0, 1, &buf, NULL, status, 0) == 0) {
-					numa_node = status[0];	
+					numa_node = status[0];
 				} else {
 					LOG_ERROR("move_pages call error: %d - %s", errno, strerror(errno));
 				}
@@ -756,7 +756,7 @@ static void cleanup_devices() {
 		devices[i] = NULL;
 	}
 }
- 
+
 static int dsa_init_from_wq_list(char *wq_list)
 {
 	char *wq;
@@ -820,7 +820,7 @@ static int dsa_init_from_wq_list(char *wq_list)
         if (wq_mode[0] == '\0') {
 			close(dir_fd);
 			rc = -ENOTSUP;
-			goto fail_wq;			
+			goto fail_wq;
 		}
 
 		if (strcmp(wq_mode, "shared") != 0) {
@@ -856,7 +856,7 @@ static int dsa_init_from_wq_list(char *wq_list)
 
 		if (is_numa_aware) {
 			struct dto_device* dev = get_dto_device(dev_numa_node);
-			if (dev != NULL && 
+			if (dev != NULL &&
 				dev->num_wqs < MAX_WQS) {
 				dev->wqs[dev->num_wqs++] = &wqs[num_wqs];
 			}
@@ -911,9 +911,9 @@ static int dsa_init_from_accfg(void)
 	num_wqs = 0;
 
 	accfg_device_foreach(dto_ctx, device) {
-		enum accfg_device_state dstate;		
+		enum accfg_device_state dstate;
 
-    	/* use dsa devices only*/
+		/* use dsa devices only*/
 		if (strncmp(accfg_device_get_devname(device), "dsa", 3)!= 0)
 			continue;
 
@@ -934,7 +934,7 @@ static int dsa_init_from_accfg(void)
 		if (is_numa_aware) {
 			const int dev_numa_node = accfg_device_get_numa_node(device);
 			dev = get_dto_device(dev_numa_node);
-		}	
+		}
 
 		accfg_wq_foreach(device, wq) {
 			enum accfg_wq_state wstate;
