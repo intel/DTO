@@ -1249,7 +1249,7 @@ static void cleanup_dto(void)
 #endif
 	if (log_fd != -1)
 		close(log_fd);
-	
+
 	cleanup_devices();
 }
 
@@ -1264,17 +1264,17 @@ static __always_inline  struct dto_wq *get_wq(void* buf)
 		const int numa_node = get_numa_node(buf);
 		if (numa_node >= 0 && numa_node < MAX_NUMA_NODES) {
 			struct dto_device* dev = devices[numa_node];
-			if (dev != NULL && 
+			if (dev != NULL &&
 				dev->num_wqs > 0) {
 				wq = dev->wqs[dev->next_wq++ % dev->num_wqs];
-			}			
+			}
 		}
 	}
 
 	if (wq == NULL) {
 		wq = &wqs[next_wq++ % num_wqs];
 	}
-	
+
 	return wq;
 }
 
