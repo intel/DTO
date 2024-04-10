@@ -688,13 +688,6 @@ static struct dto_device* get_dto_device(int dev_numa_node) {
 }
 
 static void correct_devices_list() {
-/* 	Fill NULL gaps in devices list.
-	For SNC configurations there are less DSA devices then numa nodes
-	ex. SNC4: 8 numa nodes, 2 DSA devices:
-	dsa0 device has numa_node = 0, dsa2 device has numa_node = 4
-	Then we should use dsa0 device for numa_nodes = 0,1,2,3 and dsa2 device for numa_nodes = 4,5,6,7
-	and model the same in devices list.
- */
 	struct dto_device* dev = NULL;
 	for (uint8_t i = 0; i < MAX_NUMA_NODES; i++) {
 		if (devices[i] != NULL) {
