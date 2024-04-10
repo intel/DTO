@@ -19,7 +19,11 @@ DTO library falls back to using standard APIs on CPU under following scenarios:
 To improve throughput for synchronous offload, DTO uses "pseudo asynchronous" execution using following steps.
 1) After intercepting the API call, DTO splits the API job into two parts; 1) CPU job and 2) DSA job. For example, a 64 KB memcpy may
    be split into 20 KB CPU job and 44 KB DSA job. The split fraction can be configured using an environment variable DTO_CPU_SIZE_FRACTION. 
-2) DTO submits the DSA portion of the job to DSA.
+2) DTO submits the DSA portion of the job to DSA. 
+   If DTO_IS_NUMA_AWARE=1 DTO uses work queues of DSA device located on the same numa node as 
+   buffer (memcpy/memmove - dest buffer, memcmp - ptr2) delivered to method - buffer-centric numa awareness.
+   If DTO_IS_NUMA_AWARE=2 DTO uses work queues of DSA device located on the same numa node as 
+   calling thread cpu - cpu-centric numa awareness.
 3) In parallel, DTO performs the CPU portion of the job using std library on CPU.
 4) DTO waits for DSA to complete (if it hasn't completed already). The wait method can be configured using an environment variable DTO_WAIT_METHOD.
 
@@ -44,6 +48,7 @@ Following environment variables control the behavior of DTO library:
 	DTO_MIN_BYTES=xxxx (specifies minimum size of API call needed for DSA operation execution, default is 8192 bytes)
 	DTO_CPU_SIZE_FRACTION=0.xx (specifies fraction of job performed by CPU, in parallel to DSA). Default is 0.00
 	DTO_AUTO_ADJUST_KNOBS=0/1 (disables/enables auto tuning of cpu_size_fraction and dsa_min_bytes parameters. 0 -- disable, 1 -- enable (default))
+   DTO_IS_NUMA_AWARE=0/1/2 (disables/buffer-centric/cpu-centric numa awareness. 0 -- disable (default), 1 -- buffer-centric, 2 - cpu-centric)
 	DTO_WQ_LIST="semi-colon(;) separated list of DSA WQs to use". The WQ names should match their names in /dev/dsa/ directory (see example below).
 				If not specified, DTO will try to auto-discover and use all available WQs.
 	DTO_LOG_FILE=<dto log file path> Redirect the DTO output to the specified file instead of std output (useful for debugging and statistics collection). file name is suffixed by process pid.
@@ -56,9 +61,9 @@ Pre-requisite packages:
 
 Should use glibc version 2.36 or later for best DTO performance. You can use "ldd --version" command to check glibc version on your system. glibc versions less than 2.36 have a bug which reduces DTO performance.
 
-On Fedora/CentOS/Rhel: kernel-headers, accel-config-devel, libuuid-devel
+On Fedora/CentOS/Rhel: kernel-headers, accel-config-devel, libuuid-devel, libnuma-devel
 
-On Ubuntu/Debian: linux-libc-dev, libaccel-config-dev, uuid-dev
+On Ubuntu/Debian: linux-libc-dev, libaccel-config-dev, uuid-dev, libnuma-dev
 
 ```bash
 make libdto
@@ -89,6 +94,7 @@ make dto-test-wodto
             export DTO_CPU_SIZE_FRACTION=0.33
             export DTO_AUTO_ADJUST_KNOBS=1
             export DTO_WQ_LIST="wq0.0;wq2.0;wq4.0;wq6.0"
+            export DTO_IS_NUMA_AWARE=1
 	iii. Run the application - (CacheBench example below)
     3b. Using LD_PRELOAD method (doesn not require recompiling the application)
 	i. setup LD_PRELOAD environment variable to point to DTO library
