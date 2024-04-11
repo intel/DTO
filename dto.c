@@ -725,14 +725,7 @@ static struct dto_device* get_dto_device(int dev_numa_node) {
 }
 
 static void correct_devices_list() {
-/* 	Fill NULL gaps in devices list.
-	For SNC configurations there are less DSA devices then numa nodes
-	ex. SNC4: 8 numa nodes, 2 DSA devices:
-	dsa0 device has numa_node = 0, dsa2 device has numa_node = 4
-	Then we should use dsa0 device for numa_nodes = 0,1,2,3 and dsa2 device for numa_nodes = 4,5,6,7
-	and model the same in devices list.	
- */	
- 	struct dto_device* dev = NULL;
+	struct dto_device* dev = NULL;
 	for (uint8_t i = 0; i < MAX_NUMA_NODES; i++) {
 		if (devices[i] != NULL) {
 			dev = devices[i];
@@ -744,7 +737,7 @@ static void correct_devices_list() {
 
 static __always_inline  int get_numa_node(void* buf) {
 	int numa_node = -1;
-	
+
 	switch (is_numa_aware) {
         case NA_BUFFER_CENTRIC: {
 			if (buf != NULL) {
@@ -752,7 +745,7 @@ static __always_inline  int get_numa_node(void* buf) {
 
 				// get numa node of memory pointed by buf
 				if (move_pages(0, 1, &buf, NULL, status, 0) == 0) {
-					numa_node = status[0];	
+					numa_node = status[0];
 				} else {
 					LOG_ERROR("move_pages call error: %d - %s", errno, strerror(errno));
 				}
@@ -761,6 +754,8 @@ static __always_inline  int get_numa_node(void* buf) {
 				// if (get_mempolicy(&numa_node, NULL, 0, (void *)buf, MPOL_F_NODE | MPOL_F_ADDR) != 0) {
 				// 	LOG_ERROR("get_mempolicy call error: %d - %s", errno, strerror(errno));
 				// }
+			} else {
+				LOG_ERROR("NULL buffer delivered. Unable to detect numa node");
 			}
 		}
 		break;
@@ -791,7 +786,7 @@ static void cleanup_devices() {
 		devices[i] = NULL;
 	}
 }
- 
+
 static int dsa_init_from_wq_list(char *wq_list)
 {
 	char *wq;
@@ -855,7 +850,7 @@ static int dsa_init_from_wq_list(char *wq_list)
         if (wq_mode[0] == '\0') {
 			close(dir_fd);
 			rc = -ENOTSUP;
-			goto fail_wq;			
+			goto fail_wq;
 		}
 
 		if ((dsa_mode == DM_SHARED && strcmp(wq_mode, "shared") != 0) || 
@@ -892,7 +887,7 @@ static int dsa_init_from_wq_list(char *wq_list)
 
 		if (is_numa_aware) {
 			struct dto_device* dev = get_dto_device(dev_numa_node);
-			if (dev != NULL && 
+			if (dev != NULL &&
 				dev->num_wqs < MAX_WQS) {
 				dev->wqs[dev->num_wqs++] = &wqs[num_wqs];
 			}
@@ -947,9 +942,9 @@ static int dsa_init_from_accfg(void)
 	num_wqs = 0;
 
 	accfg_device_foreach(dto_ctx, device) {
-		enum accfg_device_state dstate;		
+		enum accfg_device_state dstate;
 
-    	/* use dsa devices only*/
+		/* use dsa devices only*/
 		if (strncmp(accfg_device_get_devname(device), "dsa", 3)!= 0)
 			continue;
 
@@ -970,7 +965,7 @@ static int dsa_init_from_accfg(void)
 		if (is_numa_aware) {
 			const int dev_numa_node = accfg_device_get_numa_node(device);
 			dev = get_dto_device(dev_numa_node);
-		}	
+		}
 
 		accfg_wq_foreach(device, wq) {
 			enum accfg_wq_state wstate;
@@ -1294,7 +1289,7 @@ static void cleanup_dto(void)
 #endif
 	if (log_fd != -1)
 		close(log_fd);
-	
+
 	cleanup_devices();
 }
 
@@ -1302,25 +1297,24 @@ static __always_inline  struct dto_wq *get_wq(void* buf)
 {
 	struct dto_wq* wq = NULL;
 
-	if (is_numa_aware &&
-		buf != NULL) {
+	if (is_numa_aware) {
 		int status[1] = {-1};
 
 		// get the numa node for the target DSA device
 		const int numa_node = get_numa_node(buf);
 		if (numa_node >= 0 && numa_node < MAX_NUMA_NODES) {
 			struct dto_device* dev = devices[numa_node];
-			if (dev != NULL && 
+			if (dev != NULL &&
 				dev->num_wqs > 0) {
 				wq = dev->wqs[dev->next_wq++ % dev->num_wqs];
-			}			
+			}
 		}
 	}
 
 	if (wq == NULL) {
 		wq = &wqs[next_wq++ % num_wqs];
 	}
-	
+
 	return wq;
 }
 
