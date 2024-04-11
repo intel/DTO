@@ -262,7 +262,7 @@ static atomic_ullong adjust_num_waits;
 static double min_avg_waits = MIN_AVG_YIELD_WAITS;
 static double max_avg_waits = MAX_AVG_YIELD_WAITS;
 static uint8_t auto_adjust_knobs = 1;
-static enum dsa_mode dsa_mode = DM_SHARED; 
+static enum dsa_mode dsa_mode = DM_SHARED;
 
 extern char *__progname;
 
@@ -492,7 +492,7 @@ static __always_inline int dsa_submit(struct dto_wq *wq,
 		case DM_DEDICATED: {
 			movdir64b(hw, wq->wq_portal);
 			return SUCCESS;
-		} 
+		}
 	}
 	return FAIL_OTHERS;
 }
@@ -739,7 +739,7 @@ static __always_inline  int get_numa_node(void* buf) {
 	int numa_node = -1;
 
 	switch (is_numa_aware) {
-        case NA_BUFFER_CENTRIC: {
+		case NA_BUFFER_CENTRIC: {
 			if (buf != NULL) {
 				int status[1] = {-1};
 
@@ -769,11 +769,11 @@ static __always_inline  int get_numa_node(void* buf) {
 			}
 		}
 		break;
-        default:
+		default:
 		break;
-        }
+		}
 
-        return numa_node;
+	return numa_node;
 }
 
 static void cleanup_devices() {
@@ -847,14 +847,14 @@ static int dsa_init_from_wq_list(char *wq_list)
 
 		dto_get_param_string(dir_fd, "mode", wq_mode);
 
-        if (wq_mode[0] == '\0') {
+		if (wq_mode[0] == '\0') {
 			close(dir_fd);
 			rc = -ENOTSUP;
 			goto fail_wq;
 		}
 
-		if ((dsa_mode == DM_SHARED && strcmp(wq_mode, "shared") != 0) || 
-		    (dsa_mode == DM_DEDICATED && strcmp(wq_mode, "dedicated") != 0)) {
+		if ((dsa_mode == DM_SHARED && strcmp(wq_mode, "shared") != 0) ||
+			(dsa_mode == DM_DEDICATED && strcmp(wq_mode, "dedicated") != 0)) {
 			continue;
 		}
 
@@ -985,7 +985,7 @@ static int dsa_init_from_accfg(void)
 			/* the wq mode should be shared work queue */
 			mode = accfg_wq_get_mode(wq);
 			if ((dsa_mode == DM_SHARED && mode != ACCFG_WQ_SHARED) ||
-			    (dsa_mode == DM_DEDICATED && mode != ACCFG_WQ_DEDICATED))
+				(dsa_mode == DM_DEDICATED && mode != ACCFG_WQ_DEDICATED))
 				continue;
 
 			wqs[num_wqs].wq_size = accfg_wq_get_size(wq);
