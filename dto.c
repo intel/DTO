@@ -740,23 +740,19 @@ static __always_inline  int get_numa_node(void* buf) {
 
 	switch (is_numa_aware) {
 		case NA_BUFFER_CENTRIC: {
-			if (buf != NULL) {
-				int status[1] = {-1};
+			int status[1] = {-1};
 
-				// get numa node of memory pointed by buf
-				if (move_pages(0, 1, &buf, NULL, status, 0) == 0) {
-					numa_node = status[0];
-				} else {
-					LOG_ERROR("move_pages call error: %d - %s", errno, strerror(errno));
-				}
-
-				// alternatively get_mempolicy can be used
-				// if (get_mempolicy(&numa_node, NULL, 0, (void *)buf, MPOL_F_NODE | MPOL_F_ADDR) != 0) {
-				// 	LOG_ERROR("get_mempolicy call error: %d - %s", errno, strerror(errno));
-				// }
+			// get numa node of memory pointed by buf
+			if (move_pages(0, 1, &buf, NULL, status, 0) == 0) {
+				numa_node = status[0];
 			} else {
-				LOG_ERROR("NULL buffer delivered. Unable to detect numa node");
+				LOG_ERROR("move_pages call error: %d - %s", errno, strerror(errno));
 			}
+
+			// alternatively get_mempolicy can be used
+			// if (get_mempolicy(&numa_node, NULL, 0, (void *)buf, MPOL_F_NODE | MPOL_F_ADDR) != 0) {
+			// 	LOG_ERROR("get_mempolicy call error: %d - %s", errno, strerror(errno));
+			// }
 		}
 		break;
 		case NA_CPU_CENTRIC: {
@@ -1298,8 +1294,6 @@ static __always_inline  struct dto_wq *get_wq(void* buf)
 	struct dto_wq* wq = NULL;
 
 	if (is_numa_aware) {
-		int status[1] = {-1};
-
 		// get the numa node for the target DSA device
 		const int numa_node = get_numa_node(buf);
 		if (numa_node >= 0 && numa_node < MAX_NUMA_NODES) {
