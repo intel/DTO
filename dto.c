@@ -23,6 +23,7 @@
 #include <accel-config/libaccel_config.h>
 #include <numaif.h>
 #include <numa.h>
+#include <linux/limits.h>
 
 #define likely(x)       __builtin_expect((x), 1)
 #define unlikely(x)     __builtin_expect((x), 0)
@@ -69,6 +70,8 @@ struct dto_wq {
 	uint32_t max_transfer_size;
 	int wq_fd;
 	void *wq_portal;
+	enum accfg_wq_mode wq_mode;
+	atomic_int dwq_desc_outstanding;
 };
 
 struct dto_device {
@@ -96,14 +99,10 @@ static const char * const numa_aware_names[] = {
 	[NA_CPU_CENTRIC] = "cpu-centric"
 };
 
-enum dsa_mode {
-	DM_SHARED = 0,
-	DM_DEDICATED
-};
-
-static const char * const dsa_mode_names[] = {
-	[DM_SHARED] = "shared",
-	[DM_DEDICATED] = "dedicated"
+static const char * const wq_mode_names[] = {
+	[ACCFG_WQ_SHARED] = "shared",
+	[ACCFG_WQ_DEDICATED] = "dedicated",
+	[ACCFG_WQ_MODE_UNKNOWN] = "unknown"
 };
 
 // global workqueue variables
@@ -262,7 +261,6 @@ static atomic_ullong adjust_num_waits;
 static double min_avg_waits = MIN_AVG_YIELD_WAITS;
 static double max_avg_waits = MAX_AVG_YIELD_WAITS;
 static uint8_t auto_adjust_knobs = 1;
-static enum dsa_mode dsa_mode = DM_SHARED;
 
 extern char *__progname;
 
@@ -463,6 +461,10 @@ static __always_inline int dsa_wait(struct dto_wq *wq,
 	else
 		dsa_wait_no_adjust(comp);
 
+	if (wq->wq_mode == ACCFG_WQ_DEDICATED) {
+		wq->dwq_desc_outstanding--;
+	}
+
 	if (likely(*comp == DSA_COMP_SUCCESS)) {
 		thr_bytes_completed += hw->xfer_size;
 		return SUCCESS;
@@ -478,56 +480,73 @@ static __always_inline int dsa_submit(struct dto_wq *wq,
 	struct dsa_hw_desc *hw)
 {
 	//LOG_TRACE("desc flags: 0x%x, opcode: 0x%x\n", hw->flags, hw->opcode);
-	__builtin_ia32_sfence();
-	switch (dsa_mode) {
-		case DM_SHARED: {
-			int retry;
-			for (int r = 0; r < ENQCMD_MAX_RETRIES; ++r) {
+	int retry = 0;
+	for (int r = 0; r < ENQCMD_MAX_RETRIES; ++r) {
+		switch (wq->wq_mode) {
+			case ACCFG_WQ_SHARED: {
+				__builtin_ia32_sfence();
 				retry = enqcmd(hw, wq->wq_portal);
-				if (!retry)
-					return SUCCESS;
+				break;
 			}
-			return RETRIES;
+			case ACCFG_WQ_DEDICATED: {
+				int old_dwq_desc_outstanding = wq->dwq_desc_outstanding;
+				/* for dedicated wq, the atomic_compare_exchange_strong provides the required store fence */
+				if (old_dwq_desc_outstanding < wq->wq_size &&
+					atomic_compare_exchange_strong(&wq->dwq_desc_outstanding, &old_dwq_desc_outstanding, old_dwq_desc_outstanding + 1)) {
+					movdir64b(hw, wq->wq_portal);
+					retry = 0;
+				} else {
+					retry = 1;
+				}
+				break;
+			}
 		}
-		case DM_DEDICATED: {
-			movdir64b(hw, wq->wq_portal);
+
+		if (!retry)
 			return SUCCESS;
-		}
 	}
-	return FAIL_OTHERS;
+
+	return RETRIES;
 }
 
 static __always_inline int dsa_execute(struct dto_wq *wq,
 	struct dsa_hw_desc *hw, volatile uint8_t *comp)
 {
-	*comp = 0;
-	bool do_wait = false;
 	//LOG_TRACE("desc flags: 0x%x, opcode: 0x%x\n", hw->flags, hw->opcode);
-	__builtin_ia32_sfence();
-	switch (dsa_mode) {
-		case DM_SHARED: {
-			int retry;
-			for (int r = 0; r < ENQCMD_MAX_RETRIES; ++r) {
+	*comp = 0;
+
+	int retry = 0;
+	for (int r = 0; r < ENQCMD_MAX_RETRIES; ++r) {
+		switch (wq->wq_mode) {
+			case ACCFG_WQ_SHARED: {
+				__builtin_ia32_sfence();
 				retry = enqcmd(hw, wq->wq_portal);
-				if (!retry) {
-					do_wait = true;
-					break;
-				}
+				break;
 			}
-			if (!do_wait)
-				return RETRIES;
-		}
-		case DM_DEDICATED: {
-			movdir64b(hw, wq->wq_portal);
-			do_wait = true;
+			case ACCFG_WQ_DEDICATED: {
+				int old_dwq_desc_outstanding = wq->dwq_desc_outstanding;
+				/* for dedicated wq, the atomic_compare_exchange_strong provides the required store fence */
+				if (old_dwq_desc_outstanding < wq->wq_size &&
+					atomic_compare_exchange_strong(&wq->dwq_desc_outstanding, &old_dwq_desc_outstanding, old_dwq_desc_outstanding + 1)) {
+					movdir64b(hw, wq->wq_portal);
+					retry = 0;
+				} else {
+					retry = 1;
+				}
+				break;
+			}
 		}
 	}
 
-	if (do_wait) {
+	if (!retry) {
 		if (auto_adjust_knobs)
 			dsa_wait_and_adjust(comp);
 		else
 			dsa_wait_no_adjust(comp);
+
+		if (wq->wq_mode == ACCFG_WQ_DEDICATED) {
+			wq->dwq_desc_outstanding--;
+		}
 
 		if (*comp == DSA_COMP_SUCCESS) {
 			thr_bytes_completed += hw->xfer_size;
@@ -540,7 +559,7 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
 		return FAIL_OTHERS;
 	}
 
-	return FAIL_OTHERS;
+	return RETRIES;
 }
 
 #ifdef DTO_STATS_SUPPORT
@@ -849,8 +868,11 @@ static int dsa_init_from_wq_list(char *wq_list)
 			goto fail_wq;
 		}
 
-		if ((dsa_mode == DM_SHARED && strcmp(wq_mode, "shared") != 0) ||
-			(dsa_mode == DM_DEDICATED && strcmp(wq_mode, "dedicated") != 0)) {
+		if (strcmp(wq_mode, "shared") == 0) {
+			wqs[num_wqs].wq_mode = ACCFG_WQ_SHARED;
+		} else if (strcmp(wq_mode, "dedicated") == 0) {
+			wqs[num_wqs].wq_mode = ACCFG_WQ_DEDICATED;
+		} else {
 			continue;
 		}
 
@@ -980,10 +1002,11 @@ static int dsa_init_from_accfg(void)
 
 			/* the wq mode should be shared work queue */
 			mode = accfg_wq_get_mode(wq);
-			if ((dsa_mode == DM_SHARED && mode != ACCFG_WQ_SHARED) ||
-				(dsa_mode == DM_DEDICATED && mode != ACCFG_WQ_DEDICATED))
+			if (mode == ACCFG_WQ_MODE_UNKNOWN) {
 				continue;
+			}
 
+			wqs[num_wqs].wq_mode = mode;
 			wqs[num_wqs].wq_size = accfg_wq_get_size(wq);
 			wqs[num_wqs].max_transfer_size = accfg_wq_get_max_transfer_size(wq);
 
@@ -1243,14 +1266,6 @@ static int init_dto(void)
 				}
 			}
 
-			env_str = getenv("DTO_DSA_MODE");
-			if (env_str != NULL) {
-				errno = 0;
-				dsa_mode = strtoul(env_str, NULL, 10);
-				if (errno || dsa_mode > DM_DEDICATED)
-					dsa_mode = DM_SHARED;
-			}
-
 			if (dsa_init()) {
 				LOG_ERROR("Didn't find any usable DSAs. Falling back to using CPUs.\n");
 				use_std_lib_calls = 1;
@@ -1258,12 +1273,12 @@ static int init_dto(void)
 
 			// display configuration
 			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
-				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dsa_mode: %s\n",
+				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s\n",
 				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
-				cpu_size_fraction, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dsa_mode_names[dsa_mode]);
+				cpu_size_fraction, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware]);
 			for (int i = 0; i < num_wqs; i++)
-				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx\n", i,
-					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap);
+				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, wq_mode: %s, dsa_cap: %lx\n", i,
+					wqs[i].wq_path, wqs[i].wq_size, wq_mode_names[wqs[i].wq_mode], wqs[i].dsa_gencap);
 		}
 		dto_initialized = 1;
 
