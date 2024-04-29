@@ -13,6 +13,7 @@
 #include <sys/mman.h>
 #include <cpuid.h>
 #include <linux/idxd.h>
+#include <sys/types.h>
 #include <x86intrin.h>
 #include <sched.h>
 #include <sys/stat.h>
@@ -31,13 +32,13 @@
 // DSA capabilities
 #define GENCAP_CC_MEMORY  0x4
 
-#define ENQCMD_MAX_RETRIES 3
+#define ENQCMD_MAX_RETRIES_DEFAULT 3
 
-#define UMWAIT_DELAY 100000
+#define UMWAIT_DELAY_DEFAULT 100000
 /* C0.1 state */
 #define UMWAIT_STATE 1
 
-#define USE_ORIG_FUNC(n) (use_std_lib_calls == 1 || n < dsa_min_size)
+#define USE_ORIG_FUNC(n, use_dsa) (use_std_lib_calls == 1 || !use_dsa || n < dsa_min_size)
 #define TS_NS(s, e) (((e.tv_sec*1000000000) + e.tv_nsec) - ((s.tv_sec*1000000000) + s.tv_nsec))
 
 /* Maximum WQs that DTO will use. It is rather an arbitrary limit
@@ -117,6 +118,14 @@ static enum numa_aware is_numa_aware;
 static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
 static int wait_method = WAIT_YIELD;
 static double cpu_size_fraction;
+
+static uint8_t dto_dsa_memcpy = 1;
+static uint8_t dto_dsa_memmove = 1;
+static uint8_t dto_dsa_memset = 1;
+static uint8_t dto_dsa_memcmp = 1;
+
+static uint16_t dto_enqcmd_max_retries = ENQCMD_MAX_RETRIES_DEFAULT;
+static unsigned long dto_umwait_delay = UMWAIT_DELAY_DEFAULT;
 
 static uint8_t fork_handler_registered;
 
@@ -361,7 +370,7 @@ static __always_inline void __dsa_wait_umwait(const volatile uint8_t *comp)
 	// Hardware never writes 0 to this field. Software should initialize this field to 0
 	// so it can detect when the completion record has been written
 	if (*comp == 0) {
-		uint64_t delay = __rdtsc() + UMWAIT_DELAY;
+		uint64_t delay = __rdtsc() + dto_umwait_delay;
 
 		umwait(delay, UMWAIT_STATE);
 	}
@@ -481,7 +490,7 @@ static __always_inline int dsa_submit(struct dto_wq *wq,
 {
 	//LOG_TRACE("desc flags: 0x%x, opcode: 0x%x\n", hw->flags, hw->opcode);
 	int retry = 0;
-	for (int r = 0; r < ENQCMD_MAX_RETRIES; ++r) {
+	for (int r = 0; r < dto_enqcmd_max_retries; ++r) {
 		switch (wq->wq_mode) {
 			case ACCFG_WQ_SHARED: {
 				__builtin_ia32_sfence();
@@ -516,7 +525,7 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
 	*comp = 0;
 
 	int retry = 0;
-	for (int r = 0; r < ENQCMD_MAX_RETRIES; ++r) {
+	for (int r = 0; r < dto_enqcmd_max_retries; ++r) {
 		switch (wq->wq_mode) {
 			case ACCFG_WQ_SHARED: {
 				__builtin_ia32_sfence();
@@ -1179,6 +1188,47 @@ static int init_dto(void)
 			use_std_lib_calls = !!use_std_lib_calls;
 		}
 
+		env_str = getenv("DTO_DSA_MEMCPY");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_memcpy = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_memcpy = 0;
+
+			dto_dsa_memcpy = !!dto_dsa_memcpy;
+		}
+
+		env_str = getenv("DTO_DSA_MEMMOVE");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_memmove = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_memmove = 0;
+
+			dto_dsa_memmove = !!dto_dsa_memmove;
+		}
+
+		env_str = getenv("DTO_DSA_MEMSET");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_memset = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_memset = 0;
+
+			dto_dsa_memset = !!dto_dsa_memset;
+		}
+
+		env_str = getenv("DTO_DSA_MEMCMP");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_memcmp = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_memcmp = 0;
+
+			dto_dsa_memcmp = !!dto_dsa_memcmp;
+		}
+
+
 #ifdef DTO_STATS_SUPPORT
 		env_str = getenv("DTO_COLLECT_STATS");
 		if (env_str != NULL) {
@@ -1266,6 +1316,24 @@ static int init_dto(void)
 				}
 			}
 
+			env_str = getenv("DTO_ENQCMD_MAX_RETRIES");
+
+			if (env_str != NULL) {
+				errno = 0;
+				dto_enqcmd_max_retries = strtoul(env_str, NULL, 10);
+				if (errno || dto_enqcmd_max_retries == 0)
+					dto_enqcmd_max_retries = ENQCMD_MAX_RETRIES_DEFAULT;
+			}
+
+			env_str = getenv("DTO_UMWAIT_DELAY");
+
+			if (env_str != NULL) {
+				errno = 0;
+				dto_umwait_delay = strtoul(env_str, NULL, 10);
+				if (errno || dto_umwait_delay == 0)
+					dto_umwait_delay = UMWAIT_DELAY_DEFAULT;
+			}
+
 			if (dsa_init()) {
 				LOG_ERROR("Didn't find any usable DSAs. Falling back to using CPUs.\n");
 				use_std_lib_calls = 1;
@@ -1273,9 +1341,9 @@ static int init_dto(void)
 
 			// display configuration
 			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
-				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s\n",
+				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, dto_enqcmd_max_retries: %d, dto_umwait_delay=%d, numa_awareness: %s, dto_dsa_memcpy=%d, dto_dsa_memmove=%d, dto_dsa_memset=%d, dto_dsa_memcmp=%d\n",
 				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
-				cpu_size_fraction, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware]);
+				cpu_size_fraction, wait_names[wait_method], auto_adjust_knobs, dto_enqcmd_max_retries, dto_umwait_delay, numa_aware_names[is_numa_aware], dto_dsa_memcpy, dto_dsa_memmove, dto_dsa_memset, dto_dsa_memcmp);
 			for (int i = 0; i < num_wqs; i++)
 				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, wq_mode: %s, dsa_cap: %lx\n", i,
 					wqs[i].wq_path, wqs[i].wq_size, wq_mode_names[wqs[i].wq_mode], wqs[i].dsa_gencap);
@@ -1600,7 +1668,7 @@ void *memset(void *s1, int c, size_t n)
 {
 	int result = 0;
 	void *ret = s1;
-	int use_orig_func = USE_ORIG_FUNC(n);
+	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memset);
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
@@ -1650,7 +1718,7 @@ void *memcpy(void *dest, const void *src, size_t n)
 {
 	int result = 0;
 	void *ret = dest;
-	int use_orig_func = USE_ORIG_FUNC(n);
+	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memcpy);
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
@@ -1703,7 +1771,7 @@ void *memmove(void *dest, const void *src, size_t n)
 {
 	int result = 0;
 	void *ret = dest;
-	int use_orig_func = USE_ORIG_FUNC(n);
+	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memmove);
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
@@ -1756,7 +1824,7 @@ int memcmp(const void *s1, const void *s2, size_t n)
 {
 	int result = 0;
 	int ret;
-	int use_orig_func = USE_ORIG_FUNC(n);
+	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memcmp);
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
