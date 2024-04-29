@@ -55,8 +55,8 @@ Following environment variables control the behavior of DTO library:
    DTO_DSA_MEMMOVE=0/1, 1 (default) - DTO uses DSA to process memmove, 0 - DTO uses system memmove
    DTO_DSA_MEMSET=0/1, 1 (default) - DTO uses DSA to process memset, 0 - DTO use system memset
    DTO_DSA_MEMCMP=0/1, 1 (default) - DTO uses DSA to process memcmp, 0 - DTO use system memcmp
-   DTO_ENQCMD_MAX_RETRIES - defines maximal number of retries for enquing command into DSA queue, default is 3
-   DTO_UMWAIT_DELAY - defines delay for umwait command (check max possible value at: /sys/devices/system/cpu/umwait_control/max_time), default is 100000
+   DTO_ENQCMD_MAX_RETRIES=xxxx defines maximal number of retries for enquing command into DSA queue, default is 3
+   DTO_UMWAIT_DELAY=xxxx defines delay for umwait command (check max possible value at: /sys/devices/system/cpu/umwait_control/max_time), default is 100000
 	DTO_LOG_FILE=<dto log file path> Redirect the DTO output to the specified file instead of std output (useful for debugging and statistics collection). file name is suffixed by process pid.
 	DTO_LOG_LEVEL=0/1/2 controls the log level. higher value means more verbose logging (default 0).
 ```
