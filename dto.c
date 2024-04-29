@@ -1340,12 +1340,12 @@ static int init_dto(void)
 			}
 
 			// display configuration
-			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, cpu_size_fraction: %.2f, \
-							wait_method: %s, auto_adjust_knobs: %d, dto_enqcmd_max_retries: %d, dto_umwait_delay=%d, numa_awareness: %s, \
-							dto_dsa_memcpy=%d, dto_dsa_memmove=%d, dto_dsa_memset=%d, dto_dsa_memcmp=%d\n",
-							log_level, collect_stats, use_std_lib_calls, dsa_min_size, cpu_size_fraction, wait_names[wait_method],
-							auto_adjust_knobs, dto_enqcmd_max_retries, dto_umwait_delay, numa_aware_names[is_numa_aware],
-							dto_dsa_memcpy, dto_dsa_memmove, dto_dsa_memset, dto_dsa_memcmp);
+			LOG_TRACE( "log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, cpu_size_fraction: %.2f, \
+						wait_method: %s, auto_adjust_knobs: %d, dto_enqcmd_max_retries: %d, dto_umwait_delay=%d, numa_awareness: %s, \
+						dto_dsa_memcpy=%d, dto_dsa_memmove=%d, dto_dsa_memset=%d, dto_dsa_memcmp=%d\n",
+						log_level, collect_stats, use_std_lib_calls, dsa_min_size, cpu_size_fraction,
+						wait_names[wait_method], auto_adjust_knobs, dto_enqcmd_max_retries, dto_umwait_delay, numa_aware_names[is_numa_aware],
+						dto_dsa_memcpy, dto_dsa_memmove, dto_dsa_memset, dto_dsa_memcmp);
 			for (int i = 0; i < num_wqs; i++)
 				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, wq_mode: %s, dsa_cap: %lx\n", i,
 					wqs[i].wq_path, wqs[i].wq_size, wq_mode_names[wqs[i].wq_mode], wqs[i].dsa_gencap);
