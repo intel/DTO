@@ -13,6 +13,7 @@
 #include <sys/mman.h>
 #include <cpuid.h>
 #include <linux/idxd.h>
+#include <sys/types.h>
 #include <x86intrin.h>
 #include <sched.h>
 #include <sys/stat.h>
@@ -23,6 +24,7 @@
 #include <accel-config/libaccel_config.h>
 #include <numaif.h>
 #include <numa.h>
+#include <linux/limits.h>
 
 #define likely(x)       __builtin_expect((x), 1)
 #define unlikely(x)     __builtin_expect((x), 0)
@@ -30,13 +32,13 @@
 // DSA capabilities
 #define GENCAP_CC_MEMORY  0x4
 
-#define ENQCMD_MAX_RETRIES 3
+#define ENQCMD_MAX_RETRIES_DEFAULT 3
 
-#define UMWAIT_DELAY 100000
+#define UMWAIT_DELAY_DEFAULT 100000
 /* C0.1 state */
 #define UMWAIT_STATE 1
 
-#define USE_ORIG_FUNC(n) (use_std_lib_calls == 1 || n < dsa_min_size)
+#define USE_ORIG_FUNC(n, use_dsa) (use_std_lib_calls == 1 || !use_dsa || n < dsa_min_size)
 #define TS_NS(s, e) (((e.tv_sec*1000000000) + e.tv_nsec) - ((s.tv_sec*1000000000) + s.tv_nsec))
 
 /* Maximum WQs that DTO will use. It is rather an arbitrary limit
@@ -69,6 +71,8 @@ struct dto_wq {
 	uint32_t max_transfer_size;
 	int wq_fd;
 	void *wq_portal;
+	enum accfg_wq_mode wq_mode;
+	atomic_int dwq_desc_outstanding;
 };
 
 struct dto_device {
@@ -96,6 +100,12 @@ static const char * const numa_aware_names[] = {
 	[NA_CPU_CENTRIC] = "cpu-centric"
 };
 
+static const char * const wq_mode_names[] = {
+	[ACCFG_WQ_SHARED] = "shared",
+	[ACCFG_WQ_DEDICATED] = "dedicated",
+	[ACCFG_WQ_MODE_UNKNOWN] = "unknown"
+};
+
 // global workqueue variables
 static struct dto_wq wqs[MAX_WQS];
 static struct dto_device* devices[MAX_NUMA_NODES];
@@ -108,6 +118,14 @@ static enum numa_aware is_numa_aware;
 static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
 static int wait_method = WAIT_YIELD;
 static double cpu_size_fraction;
+
+static uint8_t dto_dsa_memcpy = 1;
+static uint8_t dto_dsa_memmove = 1;
+static uint8_t dto_dsa_memset = 1;
+static uint8_t dto_dsa_memcmp = 1;
+
+static uint16_t dto_enqcmd_max_retries = ENQCMD_MAX_RETRIES_DEFAULT;
+static unsigned long dto_umwait_delay = UMWAIT_DELAY_DEFAULT;
 
 static uint8_t fork_handler_registered;
 
@@ -352,7 +370,7 @@ static __always_inline void __dsa_wait_umwait(const volatile uint8_t *comp)
 	// Hardware never writes 0 to this field. Software should initialize this field to 0
 	// so it can detect when the completion record has been written
 	if (*comp == 0) {
-		uint64_t delay = __rdtsc() + UMWAIT_DELAY;
+		uint64_t delay = __rdtsc() + dto_umwait_delay;
 
 		umwait(delay, UMWAIT_STATE);
 	}
@@ -452,6 +470,10 @@ static __always_inline int dsa_wait(struct dto_wq *wq,
 	else
 		dsa_wait_no_adjust(comp);
 
+	if (wq->wq_mode == ACCFG_WQ_DEDICATED) {
+		wq->dwq_desc_outstanding--;
+	}
+
 	if (likely(*comp == DSA_COMP_SUCCESS)) {
 		thr_bytes_completed += hw->xfer_size;
 		return SUCCESS;
@@ -466,43 +488,86 @@ static __always_inline int dsa_wait(struct dto_wq *wq,
 static __always_inline int dsa_submit(struct dto_wq *wq,
 	struct dsa_hw_desc *hw)
 {
-	int retry;
 	//LOG_TRACE("desc flags: 0x%x, opcode: 0x%x\n", hw->flags, hw->opcode);
-	__builtin_ia32_sfence();
-	for (int r = 0; r < ENQCMD_MAX_RETRIES; ++r) {
-		retry = enqcmd(hw, wq->wq_portal);
+	int retry = 0;
+	for (int r = 0; r < dto_enqcmd_max_retries; ++r) {
+		switch (wq->wq_mode) {
+			case ACCFG_WQ_SHARED: {
+				__builtin_ia32_sfence();
+				retry = enqcmd(hw, wq->wq_portal);
+				break;
+			}
+			case ACCFG_WQ_DEDICATED: {
+				int old_dwq_desc_outstanding = wq->dwq_desc_outstanding;
+				/* for dedicated wq, the atomic_compare_exchange_strong provides the required store fence */
+				if (old_dwq_desc_outstanding < wq->wq_size &&
+					atomic_compare_exchange_strong(&wq->dwq_desc_outstanding, &old_dwq_desc_outstanding, old_dwq_desc_outstanding + 1)) {
+					movdir64b(hw, wq->wq_portal);
+					retry = 0;
+				} else {
+					retry = 1;
+				}
+				break;
+			}
+		}
+
 		if (!retry)
 			return SUCCESS;
 	}
+
 	return RETRIES;
 }
 
 static __always_inline int dsa_execute(struct dto_wq *wq,
 	struct dsa_hw_desc *hw, volatile uint8_t *comp)
 {
-	int retry;
-	*comp = 0;
 	//LOG_TRACE("desc flags: 0x%x, opcode: 0x%x\n", hw->flags, hw->opcode);
-	__builtin_ia32_sfence();
-	for (int r = 0; r < ENQCMD_MAX_RETRIES; ++r) {
-		retry = enqcmd(hw, wq->wq_portal);
-		if (!retry) {
-			if (auto_adjust_knobs)
-				dsa_wait_and_adjust(comp);
-			else
-				dsa_wait_no_adjust(comp);
+	*comp = 0;
 
-			if (*comp == DSA_COMP_SUCCESS) {
-				thr_bytes_completed += hw->xfer_size;
-				return SUCCESS;
-			} else if ((*comp & DSA_COMP_STATUS_MASK) == DSA_COMP_PAGE_FAULT_NOBOF) {
-				thr_bytes_completed += thr_comp.bytes_completed;
-				return PAGE_FAULT;
+	int retry = 0;
+	for (int r = 0; r < dto_enqcmd_max_retries; ++r) {
+		switch (wq->wq_mode) {
+			case ACCFG_WQ_SHARED: {
+				__builtin_ia32_sfence();
+				retry = enqcmd(hw, wq->wq_portal);
+				break;
 			}
-			LOG_ERROR("failed status %x xfersz %x\n", *comp, hw->xfer_size);
-			return FAIL_OTHERS;
+			case ACCFG_WQ_DEDICATED: {
+				int old_dwq_desc_outstanding = wq->dwq_desc_outstanding;
+				/* for dedicated wq, the atomic_compare_exchange_strong provides the required store fence */
+				if (old_dwq_desc_outstanding < wq->wq_size &&
+					atomic_compare_exchange_strong(&wq->dwq_desc_outstanding, &old_dwq_desc_outstanding, old_dwq_desc_outstanding + 1)) {
+					movdir64b(hw, wq->wq_portal);
+					retry = 0;
+				} else {
+					retry = 1;
+				}
+				break;
+			}
 		}
 	}
+
+	if (!retry) {
+		if (auto_adjust_knobs)
+			dsa_wait_and_adjust(comp);
+		else
+			dsa_wait_no_adjust(comp);
+
+		if (wq->wq_mode == ACCFG_WQ_DEDICATED) {
+			wq->dwq_desc_outstanding--;
+		}
+
+		if (*comp == DSA_COMP_SUCCESS) {
+			thr_bytes_completed += hw->xfer_size;
+			return SUCCESS;
+		} else if ((*comp & DSA_COMP_STATUS_MASK) == DSA_COMP_PAGE_FAULT_NOBOF) {
+			thr_bytes_completed += thr_comp.bytes_completed;
+			return PAGE_FAULT;
+		}
+		LOG_ERROR("failed status %x xfersz %x\n", *comp, hw->xfer_size);
+		return FAIL_OTHERS;
+	}
+
 	return RETRIES;
 }
 
@@ -702,24 +767,20 @@ static __always_inline  int get_numa_node(void* buf) {
 	int numa_node = -1;
 
 	switch (is_numa_aware) {
-        case NA_BUFFER_CENTRIC: {
-			if (buf != NULL) {
-				int status[1] = {-1};
+		case NA_BUFFER_CENTRIC: {
+			int status[1] = {-1};
 
-				// get numa node of memory pointed by buf
-				if (move_pages(0, 1, &buf, NULL, status, 0) == 0) {
-					numa_node = status[0];
-				} else {
-					LOG_ERROR("move_pages call error: %d - %s", errno, strerror(errno));
-				}
-
-				// alternatively get_mempolicy can be used
-				// if (get_mempolicy(&numa_node, NULL, 0, (void *)buf, MPOL_F_NODE | MPOL_F_ADDR) != 0) {
-				// 	LOG_ERROR("get_mempolicy call error: %d - %s", errno, strerror(errno));
-				// }
+			// get numa node of memory pointed by buf
+			if (move_pages(0, 1, &buf, NULL, status, 0) == 0) {
+				numa_node = status[0];
 			} else {
-				LOG_ERROR("NULL buffer delivered. Unable to detect numa node");
+				LOG_ERROR("move_pages call error: %d - %s", errno, strerror(errno));
 			}
+
+			// alternatively get_mempolicy can be used
+			// if (get_mempolicy(&numa_node, NULL, 0, (void *)buf, MPOL_F_NODE | MPOL_F_ADDR) != 0) {
+			// 	LOG_ERROR("get_mempolicy call error: %d - %s", errno, strerror(errno));
+			// }
 		}
 		break;
 		case NA_CPU_CENTRIC: {
@@ -732,11 +793,11 @@ static __always_inline  int get_numa_node(void* buf) {
 			}
 		}
 		break;
-        default:
+		default:
 		break;
-        }
+		}
 
-        return numa_node;
+	return numa_node;
 }
 
 static void cleanup_devices() {
@@ -810,13 +871,17 @@ static int dsa_init_from_wq_list(char *wq_list)
 
 		dto_get_param_string(dir_fd, "mode", wq_mode);
 
-        if (wq_mode[0] == '\0') {
+		if (wq_mode[0] == '\0') {
 			close(dir_fd);
 			rc = -ENOTSUP;
 			goto fail_wq;
 		}
 
-		if (strcmp(wq_mode, "shared") != 0) {
+		if (strcmp(wq_mode, "shared") == 0) {
+			wqs[num_wqs].wq_mode = ACCFG_WQ_SHARED;
+		} else if (strcmp(wq_mode, "dedicated") == 0) {
+			wqs[num_wqs].wq_mode = ACCFG_WQ_DEDICATED;
+		} else {
 			continue;
 		}
 
@@ -946,9 +1011,11 @@ static int dsa_init_from_accfg(void)
 
 			/* the wq mode should be shared work queue */
 			mode = accfg_wq_get_mode(wq);
-			if (mode != ACCFG_WQ_SHARED)
+			if (mode == ACCFG_WQ_MODE_UNKNOWN) {
 				continue;
+			}
 
+			wqs[num_wqs].wq_mode = mode;
 			wqs[num_wqs].wq_size = accfg_wq_get_size(wq);
 			wqs[num_wqs].max_transfer_size = accfg_wq_get_max_transfer_size(wq);
 
@@ -1121,16 +1188,46 @@ static int init_dto(void)
 			use_std_lib_calls = !!use_std_lib_calls;
 		}
 
-		if (numa_available() != -1) {
-			env_str = getenv("DTO_IS_NUMA_AWARE");
-			if (env_str != NULL) {
-				errno = 0;
-				is_numa_aware = strtoul(env_str, NULL, 10);
-				if (errno || is_numa_aware >= NA_LAST_ENTRY) {
-					is_numa_aware = NA_NONE;
-				}
-			}
+		env_str = getenv("DTO_DSA_MEMCPY");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_memcpy = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_memcpy = 0;
+
+			dto_dsa_memcpy = !!dto_dsa_memcpy;
 		}
+
+		env_str = getenv("DTO_DSA_MEMMOVE");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_memmove = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_memmove = 0;
+
+			dto_dsa_memmove = !!dto_dsa_memmove;
+		}
+
+		env_str = getenv("DTO_DSA_MEMSET");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_memset = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_memset = 0;
+
+			dto_dsa_memset = !!dto_dsa_memset;
+		}
+
+		env_str = getenv("DTO_DSA_MEMCMP");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_memcmp = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_memcmp = 0;
+
+			dto_dsa_memcmp = !!dto_dsa_memcmp;
+		}
+
 
 #ifdef DTO_STATS_SUPPORT
 		env_str = getenv("DTO_COLLECT_STATS");
@@ -1208,19 +1305,50 @@ static int init_dto(void)
 				auto_adjust_knobs = !!auto_adjust_knobs;
 			}
 
+			if (numa_available() != -1) {
+				env_str = getenv("DTO_IS_NUMA_AWARE");
+				if (env_str != NULL) {
+					errno = 0;
+					is_numa_aware = strtoul(env_str, NULL, 10);
+					if (errno || is_numa_aware >= NA_LAST_ENTRY) {
+						is_numa_aware = NA_NONE;
+					}
+				}
+			}
+
+			env_str = getenv("DTO_ENQCMD_MAX_RETRIES");
+
+			if (env_str != NULL) {
+				errno = 0;
+				dto_enqcmd_max_retries = strtoul(env_str, NULL, 10);
+				if (errno || dto_enqcmd_max_retries == 0)
+					dto_enqcmd_max_retries = ENQCMD_MAX_RETRIES_DEFAULT;
+			}
+
+			env_str = getenv("DTO_UMWAIT_DELAY");
+
+			if (env_str != NULL) {
+				errno = 0;
+				dto_umwait_delay = strtoul(env_str, NULL, 10);
+				if (errno || dto_umwait_delay == 0)
+					dto_umwait_delay = UMWAIT_DELAY_DEFAULT;
+			}
+
 			if (dsa_init()) {
 				LOG_ERROR("Didn't find any usable DSAs. Falling back to using CPUs.\n");
 				use_std_lib_calls = 1;
 			}
 
 			// display configuration
-			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
-				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s\n",
-				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
-				cpu_size_fraction, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware]);
+			LOG_TRACE( "log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, cpu_size_fraction: %.2f, \
+						wait_method: %s, auto_adjust_knobs: %d, dto_enqcmd_max_retries: %d, dto_umwait_delay=%d, numa_awareness: %s, \
+						dto_dsa_memcpy=%d, dto_dsa_memmove=%d, dto_dsa_memset=%d, dto_dsa_memcmp=%d\n",
+						log_level, collect_stats, use_std_lib_calls, dsa_min_size, cpu_size_fraction,
+						wait_names[wait_method], auto_adjust_knobs, dto_enqcmd_max_retries, dto_umwait_delay, numa_aware_names[is_numa_aware],
+						dto_dsa_memcpy, dto_dsa_memmove, dto_dsa_memset, dto_dsa_memcmp);
 			for (int i = 0; i < num_wqs; i++)
-				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx\n", i,
-					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap);
+				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, wq_mode: %s, dsa_cap: %lx\n", i,
+					wqs[i].wq_path, wqs[i].wq_size, wq_mode_names[wqs[i].wq_mode], wqs[i].dsa_gencap);
 		}
 		dto_initialized = 1;
 
@@ -1251,8 +1379,6 @@ static __always_inline  struct dto_wq *get_wq(void* buf)
 	struct dto_wq* wq = NULL;
 
 	if (is_numa_aware) {
-		int status[1] = {-1};
-
 		// get the numa node for the target DSA device
 		const int numa_node = get_numa_node(buf);
 		if (numa_node >= 0 && numa_node < MAX_NUMA_NODES) {
@@ -1544,7 +1670,7 @@ void *memset(void *s1, int c, size_t n)
 {
 	int result = 0;
 	void *ret = s1;
-	int use_orig_func = USE_ORIG_FUNC(n);
+	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memset);
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
@@ -1594,7 +1720,7 @@ void *memcpy(void *dest, const void *src, size_t n)
 {
 	int result = 0;
 	void *ret = dest;
-	int use_orig_func = USE_ORIG_FUNC(n);
+	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memcpy);
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
@@ -1647,7 +1773,7 @@ void *memmove(void *dest, const void *src, size_t n)
 {
 	int result = 0;
 	void *ret = dest;
-	int use_orig_func = USE_ORIG_FUNC(n);
+	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memmove);
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
@@ -1700,7 +1826,7 @@ int memcmp(const void *s1, const void *s2, size_t n)
 {
 	int result = 0;
 	int ret;
-	int use_orig_func = USE_ORIG_FUNC(n);
+	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memcmp);
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;

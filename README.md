@@ -6,8 +6,8 @@ The library intercepts standard memcpy, memmove, memset, and memcmp standard API
 and transparently uses DSA to perform those operations using DSA's memory move, fill, and compare operations. DTO is limited to
 synchronous offload model since these APIs have synchronous semantics.
 
-DTO library works with DSA's Shared Work Queues (SWQs). DTO also works with multiple DSAs and uses them in round robin manner.
-During initialization, DTO library can either auto-discover all configured SWQs (potentially on multile DSAs), or a list of specific SWQs that is 
+DTO library works with DSA's Shared and Dedicated Work Queues (SWQs). DTO also works with multiple DSAs and uses them in round robin manner.
+During initialization, DTO library can either auto-discover all configured SWQs (potentially on multile DSAs), or a list of specific SWQs that is
 specified using an environment variable DTO_WQ_LIST.
 
 DTO library falls back to using standard APIs on CPU under following scenarios:
@@ -18,18 +18,18 @@ DTO library falls back to using standard APIs on CPU under following scenarios:
 
 To improve throughput for synchronous offload, DTO uses "pseudo asynchronous" execution using following steps.
 1) After intercepting the API call, DTO splits the API job into two parts; 1) CPU job and 2) DSA job. For example, a 64 KB memcpy may
-   be split into 20 KB CPU job and 44 KB DSA job. The split fraction can be configured using an environment variable DTO_CPU_SIZE_FRACTION. 
-2) DTO submits the DSA portion of the job to DSA. 
-   If DTO_IS_NUMA_AWARE=1 DTO uses work queues of DSA device located on the same numa node as 
+   be split into 20 KB CPU job and 44 KB DSA job. The split fraction can be configured using an environment variable DTO_CPU_SIZE_FRACTION.
+2) DTO submits the DSA portion of the job to DSA.
+   If DTO_IS_NUMA_AWARE=1 DTO uses work queues of DSA device located on the same numa node as
    buffer (memcpy/memmove - dest buffer, memcmp - ptr2) delivered to method - buffer-centric numa awareness.
-   If DTO_IS_NUMA_AWARE=2 DTO uses work queues of DSA device located on the same numa node as 
+   If DTO_IS_NUMA_AWARE=2 DTO uses work queues of DSA device located on the same numa node as
    calling thread cpu - cpu-centric numa awareness.
 3) In parallel, DTO performs the CPU portion of the job using std library on CPU.
 4) DTO waits for DSA to complete (if it hasn't completed already). The wait method can be configured using an environment variable DTO_WAIT_METHOD.
 
 DTO also implements a heuristic to auto tune dsa_min_bytes and cpu_size_fraction parameters based on current DSA load. For example, if DSA is heavily loaded,
 DTO tries to reduce the DSA load by increasing cpu_size_fraction and dsa_min_bytes. Conversely, if DSA is lightly loaded, DTO tries to increase the DSA load by
-decreasing cpu_size_fraction and dsa_min_bytes. The goal of the heuristic is to minimize the wait time in step 4 above while maximizing throughput. The auto-tuning 
+decreasing cpu_size_fraction and dsa_min_bytes. The goal of the heuristic is to minimize the wait time in step 4 above while maximizing throughput. The auto-tuning
 can be enabled or disabled using an environment variable DTO_AUTO_ADJUST_KNOBS.
 
 DTO can also be used to learn certain application characterics by building histogram of various API types and sizes. The histogram can be built using an environment variable DTO_COLLECT_STATS.
@@ -51,6 +51,12 @@ Following environment variables control the behavior of DTO library:
    DTO_IS_NUMA_AWARE=0/1/2 (disables/buffer-centric/cpu-centric numa awareness. 0 -- disable (default), 1 -- buffer-centric, 2 - cpu-centric)
 	DTO_WQ_LIST="semi-colon(;) separated list of DSA WQs to use". The WQ names should match their names in /dev/dsa/ directory (see example below).
 				If not specified, DTO will try to auto-discover and use all available WQs.
+   DTO_DSA_MEMCPY=0/1, 1 (default) - DTO uses DSA to process memcpy, 0 - DTO uses system memcpy
+   DTO_DSA_MEMMOVE=0/1, 1 (default) - DTO uses DSA to process memmove, 0 - DTO uses system memmove
+   DTO_DSA_MEMSET=0/1, 1 (default) - DTO uses DSA to process memset, 0 - DTO use system memset
+   DTO_DSA_MEMCMP=0/1, 1 (default) - DTO uses DSA to process memcmp, 0 - DTO use system memcmp
+   DTO_ENQCMD_MAX_RETRIES=xxxx defines maximal number of retries for enquing command into DSA queue, default is 3
+   DTO_UMWAIT_DELAY=xxxx defines delay for umwait command (check max possible value at: /sys/devices/system/cpu/umwait_control/max_time), default is 100000
 	DTO_LOG_FILE=<dto log file path> Redirect the DTO output to the specified file instead of std output (useful for debugging and statistics collection). file name is suffixed by process pid.
 	DTO_LOG_LEVEL=0/1/2 controls the log level. higher value means more verbose logging (default 0).
 ```
@@ -138,7 +144,7 @@ Byte Range        -- set      cpy      mov      cmp      bytes        set      c
    >=2093056      -- 0        1        0        0        1975911      0        0        0        0        0            0        1        0        0        973209       0      1      0
 
 ******** Average Memory Operation Latency (us)  ********
-                     <******** stdc calls    ********> <******** dsa (success) ********> <******** dsa (failed)  ********> 
+                     <******** stdc calls    ********> <******** dsa (success) ********> <******** dsa (failed)  ********>
 Byte Range        -- set      cpy      mov      cmp      set      cpy      mov      cmp      set      cpy      mov      cmp
        0-4095     -- 0.01     0.02     0.01     0.04     0        0        0        0        0        0        0        0
     4096-8191     -- 0.07     0.42     0.47     0        0        0        0        0        0        0        0        0
