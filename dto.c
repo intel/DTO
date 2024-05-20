@@ -13,6 +13,7 @@
 #include <sys/mman.h>
 #include <cpuid.h>
 #include <linux/idxd.h>
+#include <sys/types.h>
 #include <x86intrin.h>
 #include <sched.h>
 #include <sys/stat.h>
@@ -23,6 +24,7 @@
 #include <accel-config/libaccel_config.h>
 #include <numaif.h>
 #include <numa.h>
+#include <linux/limits.h>
 
 #define likely(x)       __builtin_expect((x), 1)
 #define unlikely(x)     __builtin_expect((x), 0)
@@ -32,11 +34,11 @@
 
 #define ENQCMD_MAX_RETRIES 3
 
-#define UMWAIT_DELAY 100000
+#define UMWAIT_DELAY_DEFAULT 100000
 /* C0.1 state */
 #define UMWAIT_STATE 1
 
-#define USE_ORIG_FUNC(n) (use_std_lib_calls == 1 || n < dsa_min_size)
+#define USE_ORIG_FUNC(n, use_dsa) (use_std_lib_calls == 1 || !use_dsa || n < dsa_min_size)
 #define TS_NS(s, e) (((e.tv_sec*1000000000) + e.tv_nsec) - ((s.tv_sec*1000000000) + s.tv_nsec))
 
 /* Maximum WQs that DTO will use. It is rather an arbitrary limit
@@ -108,6 +110,13 @@ static enum numa_aware is_numa_aware;
 static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
 static int wait_method = WAIT_YIELD;
 static double cpu_size_fraction;
+
+static uint8_t dto_dsa_memcpy = 1;
+static uint8_t dto_dsa_memmove = 1;
+static uint8_t dto_dsa_memset = 1;
+static uint8_t dto_dsa_memcmp = 1;
+
+static unsigned long dto_umwait_delay = UMWAIT_DELAY_DEFAULT;
 
 static uint8_t fork_handler_registered;
 
@@ -352,7 +361,7 @@ static __always_inline void __dsa_wait_umwait(const volatile uint8_t *comp)
 	// Hardware never writes 0 to this field. Software should initialize this field to 0
 	// so it can detect when the completion record has been written
 	if (*comp == 0) {
-		uint64_t delay = __rdtsc() + UMWAIT_DELAY;
+		uint64_t delay = __rdtsc() + dto_umwait_delay;
 
 		umwait(delay, UMWAIT_STATE);
 	}
@@ -703,23 +712,19 @@ static __always_inline  int get_numa_node(void* buf) {
 
 	switch (is_numa_aware) {
         case NA_BUFFER_CENTRIC: {
-			if (buf != NULL) {
-				int status[1] = {-1};
+			int status[1] = {-1};
 
-				// get numa node of memory pointed by buf
-				if (move_pages(0, 1, &buf, NULL, status, 0) == 0) {
-					numa_node = status[0];
-				} else {
-					LOG_ERROR("move_pages call error: %d - %s", errno, strerror(errno));
-				}
-
-				// alternatively get_mempolicy can be used
-				// if (get_mempolicy(&numa_node, NULL, 0, (void *)buf, MPOL_F_NODE | MPOL_F_ADDR) != 0) {
-				// 	LOG_ERROR("get_mempolicy call error: %d - %s", errno, strerror(errno));
-				// }
+			// get numa node of memory pointed by buf
+			if (move_pages(0, 1, &buf, NULL, status, 0) == 0) {
+				numa_node = status[0];
 			} else {
-				LOG_ERROR("NULL buffer delivered. Unable to detect numa node");
+				LOG_ERROR("move_pages call error: %d - %s", errno, strerror(errno));
 			}
+
+			// alternatively get_mempolicy can be used
+			// if (get_mempolicy(&numa_node, NULL, 0, (void *)buf, MPOL_F_NODE | MPOL_F_ADDR) != 0) {
+			// 	LOG_ERROR("get_mempolicy call error: %d - %s", errno, strerror(errno));
+			// }
 		}
 		break;
 		case NA_CPU_CENTRIC: {
@@ -1121,15 +1126,44 @@ static int init_dto(void)
 			use_std_lib_calls = !!use_std_lib_calls;
 		}
 
-		if (numa_available() != -1) {
-			env_str = getenv("DTO_IS_NUMA_AWARE");
-			if (env_str != NULL) {
-				errno = 0;
-				is_numa_aware = strtoul(env_str, NULL, 10);
-				if (errno || is_numa_aware >= NA_LAST_ENTRY) {
-					is_numa_aware = NA_NONE;
-				}
-			}
+		env_str = getenv("DTO_DSA_MEMCPY");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_memcpy = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_memcpy = 0;
+
+			dto_dsa_memcpy = !!dto_dsa_memcpy;
+		}
+
+		env_str = getenv("DTO_DSA_MEMMOVE");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_memmove = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_memmove = 0;
+
+			dto_dsa_memmove = !!dto_dsa_memmove;
+		}
+
+		env_str = getenv("DTO_DSA_MEMSET");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_memset = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_memset = 0;
+
+			dto_dsa_memset = !!dto_dsa_memset;
+		}
+
+		env_str = getenv("DTO_DSA_MEMCMP");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_memcmp = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_memcmp = 0;
+
+			dto_dsa_memcmp = !!dto_dsa_memcmp;
 		}
 
 #ifdef DTO_STATS_SUPPORT
@@ -1208,6 +1242,26 @@ static int init_dto(void)
 				auto_adjust_knobs = !!auto_adjust_knobs;
 			}
 
+			if (numa_available() != -1) {
+				env_str = getenv("DTO_IS_NUMA_AWARE");
+				if (env_str != NULL) {
+					errno = 0;
+					is_numa_aware = strtoul(env_str, NULL, 10);
+					if (errno || is_numa_aware >= NA_LAST_ENTRY) {
+						is_numa_aware = NA_NONE;
+					}
+				}
+			}
+
+			env_str = getenv("DTO_UMWAIT_DELAY");
+
+			if (env_str != NULL) {
+				errno = 0;
+				dto_umwait_delay = strtoul(env_str, NULL, 10);
+				if (errno || dto_umwait_delay == 0)
+					dto_umwait_delay = UMWAIT_DELAY_DEFAULT;
+			}
+
 			if (dsa_init()) {
 				LOG_ERROR("Didn't find any usable DSAs. Falling back to using CPUs.\n");
 				use_std_lib_calls = 1;
@@ -1251,8 +1305,6 @@ static __always_inline  struct dto_wq *get_wq(void* buf)
 	struct dto_wq* wq = NULL;
 
 	if (is_numa_aware) {
-		int status[1] = {-1};
-
 		// get the numa node for the target DSA device
 		const int numa_node = get_numa_node(buf);
 		if (numa_node >= 0 && numa_node < MAX_NUMA_NODES) {
@@ -1544,7 +1596,7 @@ void *memset(void *s1, int c, size_t n)
 {
 	int result = 0;
 	void *ret = s1;
-	int use_orig_func = USE_ORIG_FUNC(n);
+	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memset);
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
@@ -1594,7 +1646,7 @@ void *memcpy(void *dest, const void *src, size_t n)
 {
 	int result = 0;
 	void *ret = dest;
-	int use_orig_func = USE_ORIG_FUNC(n);
+	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memcpy);
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
@@ -1647,7 +1699,7 @@ void *memmove(void *dest, const void *src, size_t n)
 {
 	int result = 0;
 	void *ret = dest;
-	int use_orig_func = USE_ORIG_FUNC(n);
+	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memmove);
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
@@ -1700,7 +1752,7 @@ int memcmp(const void *s1, const void *s2, size_t n)
 {
 	int result = 0;
 	int ret;
-	int use_orig_func = USE_ORIG_FUNC(n);
+	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memcmp);
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
