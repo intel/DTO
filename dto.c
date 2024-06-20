@@ -13,7 +13,6 @@
 #include <sys/mman.h>
 #include <cpuid.h>
 #include <linux/idxd.h>
-#include <sys/types.h>
 #include <x86intrin.h>
 #include <sched.h>
 #include <sys/stat.h>
@@ -24,7 +23,6 @@
 #include <accel-config/libaccel_config.h>
 #include <numaif.h>
 #include <numa.h>
-#include <linux/limits.h>
 
 #define likely(x)       __builtin_expect((x), 1)
 #define unlikely(x)     __builtin_expect((x), 0)
@@ -344,14 +342,16 @@ static __always_inline int umwait(unsigned long timeout, unsigned int state)
 
 static __always_inline void dsa_wait_yield(const volatile uint8_t *comp)
 {
-	while (*comp == 0)
+	while (*comp == 0) {
 		sched_yield();
+	}
 }
 
 static __always_inline void dsa_wait_busy_poll(const volatile uint8_t *comp)
 {
-	while (*comp == 0)
+	while (*comp == 0) {
 		_mm_pause();
+	}
 }
 
 static __always_inline void __dsa_wait_umwait(const volatile uint8_t *comp)
@@ -712,19 +712,23 @@ static __always_inline  int get_numa_node(void* buf) {
 
 	switch (is_numa_aware) {
         case NA_BUFFER_CENTRIC: {
-			int status[1] = {-1};
+			if (buf != NULL) {
+				int status[1] = {-1};
 
-			// get numa node of memory pointed by buf
-			if (move_pages(0, 1, &buf, NULL, status, 0) == 0) {
-				numa_node = status[0];
+				// get numa node of memory pointed by buf
+				if (move_pages(0, 1, &buf, NULL, status, 0) == 0) {
+					numa_node = status[0];
+				} else {
+					LOG_ERROR("move_pages call error: %d - %s", errno, strerror(errno));
+				}
+
+				// alternatively get_mempolicy can be used
+				// if (get_mempolicy(&numa_node, NULL, 0, (void *)buf, MPOL_F_NODE | MPOL_F_ADDR) != 0) {
+				// 	LOG_ERROR("get_mempolicy call error: %d - %s", errno, strerror(errno));
+				// }
 			} else {
-				LOG_ERROR("move_pages call error: %d - %s", errno, strerror(errno));
+				LOG_ERROR("NULL buffer delivered. Unable to detect numa node");
 			}
-
-			// alternatively get_mempolicy can be used
-			// if (get_mempolicy(&numa_node, NULL, 0, (void *)buf, MPOL_F_NODE | MPOL_F_ADDR) != 0) {
-			// 	LOG_ERROR("get_mempolicy call error: %d - %s", errno, strerror(errno));
-			// }
 		}
 		break;
 		case NA_CPU_CENTRIC: {
@@ -1305,6 +1309,8 @@ static __always_inline  struct dto_wq *get_wq(void* buf)
 	struct dto_wq* wq = NULL;
 
 	if (is_numa_aware) {
+		int status[1] = {-1};
+
 		// get the numa node for the target DSA device
 		const int numa_node = get_numa_node(buf);
 		if (numa_node >= 0 && numa_node < MAX_NUMA_NODES) {
