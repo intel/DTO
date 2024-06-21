@@ -32,11 +32,11 @@
 
 #define ENQCMD_MAX_RETRIES 3
 
-#define UMWAIT_DELAY 100000
+#define UMWAIT_DELAY_DEFAULT 100000
 /* C0.1 state */
 #define UMWAIT_STATE 1
 
-#define USE_ORIG_FUNC(n) (use_std_lib_calls == 1 || n < dsa_min_size)
+#define USE_ORIG_FUNC(n, use_dsa) (use_std_lib_calls == 1 || !use_dsa || n < dsa_min_size)
 #define TS_NS(s, e) (((e.tv_sec*1000000000) + e.tv_nsec) - ((s.tv_sec*1000000000) + s.tv_nsec))
 
 /* Maximum WQs that DTO will use. It is rather an arbitrary limit
@@ -108,6 +108,13 @@ static enum numa_aware is_numa_aware;
 static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
 static int wait_method = WAIT_YIELD;
 static double cpu_size_fraction;
+
+static uint8_t dto_dsa_memcpy = 1;
+static uint8_t dto_dsa_memmove = 1;
+static uint8_t dto_dsa_memset = 1;
+static uint8_t dto_dsa_memcmp = 1;
+
+static unsigned long dto_umwait_delay = UMWAIT_DELAY_DEFAULT;
 
 static uint8_t fork_handler_registered;
 
@@ -335,14 +342,16 @@ static __always_inline int umwait(unsigned long timeout, unsigned int state)
 
 static __always_inline void dsa_wait_yield(const volatile uint8_t *comp)
 {
-	while (*comp == 0)
+	while (*comp == 0) {
 		sched_yield();
+	}
 }
 
 static __always_inline void dsa_wait_busy_poll(const volatile uint8_t *comp)
 {
-	while (*comp == 0)
+	while (*comp == 0) {
 		_mm_pause();
+	}
 }
 
 static __always_inline void __dsa_wait_umwait(const volatile uint8_t *comp)
@@ -352,7 +361,7 @@ static __always_inline void __dsa_wait_umwait(const volatile uint8_t *comp)
 	// Hardware never writes 0 to this field. Software should initialize this field to 0
 	// so it can detect when the completion record has been written
 	if (*comp == 0) {
-		uint64_t delay = __rdtsc() + UMWAIT_DELAY;
+		uint64_t delay = __rdtsc() + dto_umwait_delay;
 
 		umwait(delay, UMWAIT_STATE);
 	}
@@ -1121,15 +1130,44 @@ static int init_dto(void)
 			use_std_lib_calls = !!use_std_lib_calls;
 		}
 
-		if (numa_available() != -1) {
-			env_str = getenv("DTO_IS_NUMA_AWARE");
-			if (env_str != NULL) {
-				errno = 0;
-				is_numa_aware = strtoul(env_str, NULL, 10);
-				if (errno || is_numa_aware >= NA_LAST_ENTRY) {
-					is_numa_aware = NA_NONE;
-				}
-			}
+		env_str = getenv("DTO_DSA_MEMCPY");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_memcpy = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_memcpy = 0;
+
+			dto_dsa_memcpy = !!dto_dsa_memcpy;
+		}
+
+		env_str = getenv("DTO_DSA_MEMMOVE");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_memmove = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_memmove = 0;
+
+			dto_dsa_memmove = !!dto_dsa_memmove;
+		}
+
+		env_str = getenv("DTO_DSA_MEMSET");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_memset = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_memset = 0;
+
+			dto_dsa_memset = !!dto_dsa_memset;
+		}
+
+		env_str = getenv("DTO_DSA_MEMCMP");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_memcmp = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_memcmp = 0;
+
+			dto_dsa_memcmp = !!dto_dsa_memcmp;
 		}
 
 #ifdef DTO_STATS_SUPPORT
@@ -1206,6 +1244,26 @@ static int init_dto(void)
 					auto_adjust_knobs = 1;
 
 				auto_adjust_knobs = !!auto_adjust_knobs;
+			}
+
+			if (numa_available() != -1) {
+				env_str = getenv("DTO_IS_NUMA_AWARE");
+				if (env_str != NULL) {
+					errno = 0;
+					is_numa_aware = strtoul(env_str, NULL, 10);
+					if (errno || is_numa_aware >= NA_LAST_ENTRY) {
+						is_numa_aware = NA_NONE;
+					}
+				}
+			}
+
+			env_str = getenv("DTO_UMWAIT_DELAY");
+
+			if (env_str != NULL) {
+				errno = 0;
+				dto_umwait_delay = strtoul(env_str, NULL, 10);
+				if (errno || dto_umwait_delay == 0)
+					dto_umwait_delay = UMWAIT_DELAY_DEFAULT;
 			}
 
 			if (dsa_init()) {
@@ -1544,7 +1602,7 @@ void *memset(void *s1, int c, size_t n)
 {
 	int result = 0;
 	void *ret = s1;
-	int use_orig_func = USE_ORIG_FUNC(n);
+	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memset);
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
@@ -1594,7 +1652,7 @@ void *memcpy(void *dest, const void *src, size_t n)
 {
 	int result = 0;
 	void *ret = dest;
-	int use_orig_func = USE_ORIG_FUNC(n);
+	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memcpy);
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
@@ -1647,7 +1705,7 @@ void *memmove(void *dest, const void *src, size_t n)
 {
 	int result = 0;
 	void *ret = dest;
-	int use_orig_func = USE_ORIG_FUNC(n);
+	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memmove);
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
@@ -1700,7 +1758,7 @@ int memcmp(const void *s1, const void *s2, size_t n)
 {
 	int result = 0;
 	int ret;
-	int use_orig_func = USE_ORIG_FUNC(n);
+	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memcmp);
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
