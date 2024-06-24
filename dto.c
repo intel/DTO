@@ -69,6 +69,7 @@ struct dto_wq {
 	uint32_t max_transfer_size;
 	int wq_fd;
 	void *wq_portal;
+	bool wq_mmapped;
 };
 
 struct dto_device {
@@ -475,13 +476,22 @@ static __always_inline int dsa_wait(struct dto_wq *wq,
 static __always_inline int dsa_submit(struct dto_wq *wq,
 	struct dsa_hw_desc *hw)
 {
-	int retry;
+	int ret;
 	//LOG_TRACE("desc flags: 0x%x, opcode: 0x%x\n", hw->flags, hw->opcode);
 	__builtin_ia32_sfence();
 	for (int r = 0; r < ENQCMD_MAX_RETRIES; ++r) {
-		retry = enqcmd(hw, wq->wq_portal);
-		if (!retry)
-			return SUCCESS;
+
+		if (wq->wq_mmapped) {
+			ret = enqcmd(hw, wq->wq_portal);
+			if (!ret)
+				return SUCCESS;
+		} else {
+			ret = write(wq->wq_fd, hw, sizeof(*hw));
+			if (ret == sizeof(*hw))
+				return SUCCESS;
+			else
+				return FAIL_OTHERS;
+		}
 	}
 	return RETRIES;
 }
@@ -489,13 +499,23 @@ static __always_inline int dsa_submit(struct dto_wq *wq,
 static __always_inline int dsa_execute(struct dto_wq *wq,
 	struct dsa_hw_desc *hw, volatile uint8_t *comp)
 {
-	int retry;
+	int ret;
 	*comp = 0;
 	//LOG_TRACE("desc flags: 0x%x, opcode: 0x%x\n", hw->flags, hw->opcode);
 	__builtin_ia32_sfence();
 	for (int r = 0; r < ENQCMD_MAX_RETRIES; ++r) {
-		retry = enqcmd(hw, wq->wq_portal);
-		if (!retry) {
+
+		if (wq->wq_mmapped)
+			ret = enqcmd(hw, wq->wq_portal);
+
+		else {
+			ret = write(wq->wq_fd, hw, sizeof(*hw));
+			if (ret != sizeof(*hw))
+				return FAIL_OTHERS;
+			else
+				ret = 0;
+		}
+		if (!ret) {
 			if (auto_adjust_knobs)
 				dsa_wait_and_adjust(comp);
 			else
@@ -759,6 +779,29 @@ static void cleanup_devices() {
 	}
 }
 
+static bool test_write_syscall(struct dto_wq *wq)
+{
+	struct dsa_hw_desc desc = {0};
+	struct dsa_completion_record comp __attribute__((aligned(32)));
+	int retry = 0;
+
+	desc.opcode = DSA_OPCODE_NOOP;
+	desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	comp.status = 0;
+
+	desc.completion_addr = (unsigned long)&comp;
+
+	if (dsa_submit(wq, &desc) == SUCCESS) {
+		while (comp.status == 0 && retry++ < 10000)
+			_mm_pause();
+
+		if (comp.status == DSA_COMP_SUCCESS)
+			return true;
+	}
+
+	return false;
+}
+
 static int dsa_init_from_wq_list(char *wq_list)
 {
 	char *wq;
@@ -819,7 +862,7 @@ static int dsa_init_from_wq_list(char *wq_list)
 
 		dto_get_param_string(dir_fd, "mode", wq_mode);
 
-        if (wq_mode[0] == '\0') {
+		if (wq_mode[0] == '\0') {
 			close(dir_fd);
 			rc = -ENOTSUP;
 			goto fail_wq;
@@ -848,12 +891,23 @@ static int dsa_init_from_wq_list(char *wq_list)
 		// map DSA WQ portal
 		wqs[num_wqs].wq_portal = mmap(NULL, 0x1000, PROT_WRITE, MAP_SHARED | MAP_POPULATE,
 				wqs[num_wqs].wq_fd, 0);
-		close(wqs[num_wqs].wq_fd);
 
 		if (wqs[num_wqs].wq_portal == MAP_FAILED) {
-			LOG_ERROR("mmap error for DSA wq: %s, error: %s\n", wqs[num_wqs].wq_path, strerror(errno));
+			/* In case the driver doesn't support mmap, test if it
+			 * supports write system call for work submission, and
+			 * if yes, fallback to using write syscall.
+			 */
+
 			rc = -errno;
-			goto fail_wq;
+			if (test_write_syscall(&wqs[num_wqs]))
+				wqs[num_wqs].wq_mmapped = false;
+			else {
+				LOG_ERROR("mmap error for DSA wq: %s, error: %s\n", wqs[num_wqs].wq_path, strerror(errno));
+				goto fail_wq;
+			}
+		} else {
+			wqs[num_wqs].wq_mmapped = true;
+			close(wqs[num_wqs].wq_fd);
 		}
 
 		if (is_numa_aware) {
@@ -1003,12 +1057,22 @@ static int dsa_init_from_accfg(void)
 
 		// map DSA WQ portal
 		wqs[i].wq_portal = mmap(NULL, 0x1000, PROT_WRITE, MAP_SHARED | MAP_POPULATE, wqs[i].wq_fd, 0);
-		close(wqs[i].wq_fd);
 
 		if (wqs[i].wq_portal == MAP_FAILED) {
-			LOG_ERROR("mmap error for DSA wq: %s, error: %s\n", wqs[i].wq_path, strerror(errno));
+			/* In case the driver doesn't support mmap, test if it
+			 * supports write system call for work submission, and
+			 * if yes, fallback to using write syscall.
+			 */
 			rc = -errno;
-			goto fail_wq;
+			if (test_write_syscall(&wqs[i]))
+				wqs[num_wqs].wq_mmapped = false;
+			else {
+				LOG_ERROR("mmap error for DSA wq: %s, error: %s\n", wqs[i].wq_path, strerror(errno));
+				goto fail_wq;
+			}
+		} else {
+			wqs[i].wq_mmapped = true;
+			close(wqs[i].wq_fd);
 		}
 	}
 
@@ -1292,8 +1356,11 @@ static void cleanup_dto(void)
 {
 	// unmap and close wq portal
 	for (int i = 0; i < num_wqs; i++) {
-		if (wqs[i].wq_portal != NULL)
+		if (wqs[i].wq_mmapped) {
 			munmap(wqs[i].wq_portal, 0x1000);
+			wqs[i].wq_mmapped = false;
+		}
+			close(wqs[i].wq_fd);
 	}
 #ifdef DTO_STATS_SUPPORT
 	print_stats();
