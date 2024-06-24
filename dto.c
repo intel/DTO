@@ -30,8 +30,6 @@
 // DSA capabilities
 #define GENCAP_CC_MEMORY  0x4
 
-#define ENQCMD_MAX_RETRIES 3
-
 #define UMWAIT_DELAY_DEFAULT 100000
 /* C0.1 state */
 #define UMWAIT_STATE 1
@@ -154,7 +152,7 @@ static const char * const stat_group_names[] = {
 
 enum return_code {
 	SUCCESS = 0x0,
-	RETRIES,
+	RETRY,
 	PAGE_FAULT,
 	FAIL_OTHERS,
 	MAX_FAILURES,
@@ -162,7 +160,7 @@ enum return_code {
 
 static const char * const failure_names[] = {
 	[SUCCESS] = "Success",
-	[RETRIES] = "Retries",
+	[RETRY] = "Retry",
 	[PAGE_FAULT] = "PFs",
 	[FAIL_OTHERS] = "Others",
 };
@@ -479,21 +477,19 @@ static __always_inline int dsa_submit(struct dto_wq *wq,
 	int ret;
 	//LOG_TRACE("desc flags: 0x%x, opcode: 0x%x\n", hw->flags, hw->opcode);
 	__builtin_ia32_sfence();
-	for (int r = 0; r < ENQCMD_MAX_RETRIES; ++r) {
 
-		if (wq->wq_mmapped) {
-			ret = enqcmd(hw, wq->wq_portal);
-			if (!ret)
-				return SUCCESS;
-		} else {
-			ret = write(wq->wq_fd, hw, sizeof(*hw));
-			if (ret == sizeof(*hw))
-				return SUCCESS;
-			else
-				return FAIL_OTHERS;
-		}
+	if (wq->wq_mmapped) {
+		ret = enqcmd(hw, wq->wq_portal);
+		if (!ret)
+			return SUCCESS;
+	} else {
+		ret = write(wq->wq_fd, hw, sizeof(*hw));
+		if (ret == sizeof(*hw))
+			return SUCCESS;
+		else
+			return FAIL_OTHERS;
 	}
-	return RETRIES;
+	return RETRY;
 }
 
 static __always_inline int dsa_execute(struct dto_wq *wq,
@@ -503,36 +499,34 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
 	*comp = 0;
 	//LOG_TRACE("desc flags: 0x%x, opcode: 0x%x\n", hw->flags, hw->opcode);
 	__builtin_ia32_sfence();
-	for (int r = 0; r < ENQCMD_MAX_RETRIES; ++r) {
 
-		if (wq->wq_mmapped)
-			ret = enqcmd(hw, wq->wq_portal);
+	if (wq->wq_mmapped)
+		ret = enqcmd(hw, wq->wq_portal);
 
-		else {
-			ret = write(wq->wq_fd, hw, sizeof(*hw));
-			if (ret != sizeof(*hw))
-				return FAIL_OTHERS;
-			else
-				ret = 0;
-		}
-		if (!ret) {
-			if (auto_adjust_knobs)
-				dsa_wait_and_adjust(comp);
-			else
-				dsa_wait_no_adjust(comp);
-
-			if (*comp == DSA_COMP_SUCCESS) {
-				thr_bytes_completed += hw->xfer_size;
-				return SUCCESS;
-			} else if ((*comp & DSA_COMP_STATUS_MASK) == DSA_COMP_PAGE_FAULT_NOBOF) {
-				thr_bytes_completed += thr_comp.bytes_completed;
-				return PAGE_FAULT;
-			}
-			LOG_ERROR("failed status %x xfersz %x\n", *comp, hw->xfer_size);
+	else {
+		ret = write(wq->wq_fd, hw, sizeof(*hw));
+		if (ret != sizeof(*hw))
 			return FAIL_OTHERS;
-		}
+		else
+			ret = 0;
 	}
-	return RETRIES;
+	if (!ret) {
+		if (auto_adjust_knobs)
+			dsa_wait_and_adjust(comp);
+		else
+			dsa_wait_no_adjust(comp);
+
+		if (*comp == DSA_COMP_SUCCESS) {
+			thr_bytes_completed += hw->xfer_size;
+			return SUCCESS;
+		} else if ((*comp & DSA_COMP_STATUS_MASK) == DSA_COMP_PAGE_FAULT_NOBOF) {
+			thr_bytes_completed += thr_comp.bytes_completed;
+			return PAGE_FAULT;
+		}
+		LOG_ERROR("failed status %x xfersz %x\n", *comp, hw->xfer_size);
+		return FAIL_OTHERS;
+	}
+	return RETRY;
 }
 
 #ifdef DTO_STATS_SUPPORT
