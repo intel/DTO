@@ -7,7 +7,7 @@ and transparently uses DSA to perform those operations using DSA's memory move, 
 synchronous offload model since these APIs have synchronous semantics.
 
 DTO library works with DSA's Shared Work Queues (SWQs). DTO also works with multiple DSAs and uses them in round robin manner.
-During initialization, DTO library can either auto-discover all configured SWQs (potentially on multile DSAs), or a list of specific SWQs that is 
+During initialization, DTO library can either auto-discover all configured SWQs (potentially on multiple DSAs), or a list of specific SWQs that is 
 specified using an environment variable DTO_WQ_LIST.
 
 DTO library falls back to using standard APIs on CPU under following scenarios:
@@ -111,7 +111,7 @@ make dto-test-wodto
 
 4. Sample histogram given below (generated using DTO_COLLECT_STATS=1)
 	i. Numbers under columns set, cpy, mov, and cmp show number of API calls or per-API completion latency for memset, memcpy, memmove, and memcmp respectively.
-	ii. Numbers in bytes column show total bytes processed accross all 4 API calls
+	ii. Numbers in bytes column show total bytes processed across all 4 API calls
 
 ------------------------------------------------------------------------------------------------------------------------------------------
 
