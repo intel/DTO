@@ -28,6 +28,7 @@ export DTO_WAIT_METHOD=yield
 export DTO_MIN_BYTES=8192
 export DTO_CPU_SIZE_FRACTION=0.33
 export DTO_AUTO_ADJUST_KNOBS=1
+export DTO_DSA_CC=1
 
 # Run dto-test without DTO library
 #/usr/bin/time ./dto-test-wodto
