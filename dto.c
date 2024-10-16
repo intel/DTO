@@ -53,7 +53,7 @@ static __thread struct dsa_hw_desc thr_desc;
 static __thread struct dsa_completion_record thr_comp __attribute__((aligned(32)));
 static __thread uint64_t thr_bytes_completed;
 
-// orignal std memory functions
+// original std memory functions
 static void * (*orig_memset)(void *s, int c, size_t n);
 static void * (*orig_memcpy)(void *dest, const void *src, size_t n);
 static void * (*orig_memmove)(void *dest, const void *src, size_t n);
@@ -1406,7 +1406,7 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
 	thr_desc.pattern = memset_pattern;
 
-	/* cpu_size_fraction gauranteed to be >= 0 and < 1 */
+	/* cpu_size_fraction guaranteed to be >= 0 and < 1 */
 	cpu_size = n * cpu_size_fraction;
 	dsa_size = n - cpu_size;
 
@@ -1484,7 +1484,7 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 		thr_desc.flags |= IDXD_OP_FLAG_CC;
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
 
-	/* cpu_size_fraction gauranteed to be >= 0 and < 1 */
+	/* cpu_size_fraction guaranteed to be >= 0 and < 1 */
 	if (!is_memcpy && is_overlapping_buffers(dest, src, n))
 		cpu_size = 0;
 	else
@@ -1605,7 +1605,7 @@ static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
 
 		cmp_result = *t1 - *t2;
 		/* Inform the caller than the job is done even though
-		 * we didnt process all the bytes
+		 * we didn't process all the bytes
 		 */
 		thr_bytes_completed = orig_n;
 	}
