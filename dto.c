@@ -113,6 +113,8 @@ static uint8_t dto_dsa_memmove = 1;
 static uint8_t dto_dsa_memset = 1;
 static uint8_t dto_dsa_memcmp = 1;
 
+static uint8_t dto_dsa_cc = 1;
+
 static unsigned long dto_umwait_delay = UMWAIT_DELAY_DEFAULT;
 
 static uint8_t fork_handler_registered;
@@ -1198,6 +1200,16 @@ static int init_dto(void)
 			dto_dsa_memcpy = !!dto_dsa_memcpy;
 		}
 
+		env_str = getenv("DTO_DSA_CC");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_cc = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_cc = 0;
+
+			dto_dsa_cc = !!dto_dsa_cc;
+		}
+
 		env_str = getenv("DTO_DSA_MEMMOVE");
 		if (env_str != NULL) {
 			errno = 0;
@@ -1331,9 +1343,9 @@ static int init_dto(void)
 
 			// display configuration
 			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
-				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s\n",
+				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d\n",
 				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
-				cpu_size_fraction, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware]);
+				cpu_size_fraction, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc);
 			for (int i = 0; i < num_wqs; i++)
 				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx\n", i,
 					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap);
@@ -1401,7 +1413,7 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 
 	thr_desc.opcode = DSA_OPCODE_MEMFILL;
 	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
-	if (wq->dsa_gencap & GENCAP_CC_MEMORY)
+	if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
 		thr_desc.flags |= IDXD_OP_FLAG_CC;
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
 	thr_desc.pattern = memset_pattern;
@@ -1480,7 +1492,7 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 
 	thr_desc.opcode = DSA_OPCODE_MEMMOVE;
 	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
-	if (wq->dsa_gencap & GENCAP_CC_MEMORY)
+	if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
 		thr_desc.flags |= IDXD_OP_FLAG_CC;
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
 
