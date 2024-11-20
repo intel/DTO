@@ -106,7 +106,7 @@ static uint8_t use_std_lib_calls;
 static enum numa_aware is_numa_aware;
 static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
 static int wait_method = WAIT_YIELD;
-static size_t cpu_size_fraction;
+static size_t cpu_size_fraction;   // range of values is 0 to 99
 
 static uint8_t dto_dsa_memcpy = 1;
 static uint8_t dto_dsa_memmove = 1;
@@ -1405,7 +1405,7 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
 	thr_desc.pattern = memset_pattern;
 
-	/* cpu_size_fraction guaranteed to be >= 0 and < 1 */
+	/* cpu_size_fraction guaranteed to be >= 0 and < 100 */
 	cpu_size = n * cpu_size_fraction / 100;
 	dsa_size = n - cpu_size;
 
