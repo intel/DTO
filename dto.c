@@ -106,7 +106,7 @@ static uint8_t use_std_lib_calls;
 static enum numa_aware is_numa_aware;
 static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
 static int wait_method = WAIT_YIELD;
-static double cpu_size_fraction;
+static size_t cpu_size_fraction;   // range of values is 0 to 99
 
 static uint8_t dto_dsa_memcpy = 1;
 static uint8_t dto_dsa_memmove = 1;
@@ -244,9 +244,9 @@ static unsigned int log_level = LOG_LEVEL_FATAL;
 #define MAX_AVG_YIELD_WAITS 2.0
 #define MIN_AVG_POLL_WAITS 5.0
 #define MAX_AVG_POLL_WAITS 20.0
-#define MAX_CPU_SIZE_FRACTION 0.9
-#define CSF_STEP_INCREMENT 0.01
-#define CSF_STEP_DECREMENT 0.01
+#define MAX_CPU_SIZE_FRACTION 90  // specified in percent (e.g., 90 is 0.90)
+#define CSF_STEP_INCREMENT 1
+#define CSF_STEP_DECREMENT 1
 #define MAX_DSA_MIN_SIZE 65536
 #define MIN_DSA_MIN_SIZE 6144
 #define DMS_STEP_INCREMENT 1024
@@ -1292,17 +1292,16 @@ static int init_dto(void)
 
 			if (env_str != NULL) {
 				errno = 0;
-				cpu_size_fraction = strtod(env_str, NULL);
+				double cpu_size_fraction_float = strtod(env_str, NULL);
 
-				if (errno || cpu_size_fraction < 0 || cpu_size_fraction >= 1) {
+				if (errno || cpu_size_fraction_float < 0 || cpu_size_fraction_float >= 1) {
 					LOG_ERROR("Invalid DTO_CPU_SIZE_FRACTION %s, "
 						"Must be >= 0 and < 1. "
 						"Falling back to default 0.0\n", env_str);
-					cpu_size_fraction = 0.0;
+					cpu_size_fraction_float = 0.0;
 				}
 				/* Use only 2 digits after decimal point */
-				cpu_size_fraction = 100 * cpu_size_fraction;
-				cpu_size_fraction = (double) ((uint64_t)cpu_size_fraction/(double)100);
+				cpu_size_fraction = cpu_size_fraction_float * 100;
 			}
 
 			env_str = getenv("DTO_AUTO_ADJUST_KNOBS");
@@ -1418,8 +1417,8 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
 	thr_desc.pattern = memset_pattern;
 
-	/* cpu_size_fraction guaranteed to be >= 0 and < 1 */
-	cpu_size = n * cpu_size_fraction;
+	/* cpu_size_fraction guaranteed to be >= 0 and < 100 */
+	cpu_size = n * cpu_size_fraction / 100;
 	dsa_size = n - cpu_size;
 
 	thr_bytes_completed = 0;
@@ -1437,16 +1436,15 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 		}
 	} else {
 		uint32_t threshold;
-		double fraction_snapshot = cpu_size_fraction;
 
-		threshold = wq->max_transfer_size / (1 - fraction_snapshot);
+		threshold = wq->max_transfer_size * 100 / (100 - cpu_size_fraction);
 
 		do {
 			size_t len;
 
 			len = n <= threshold ? n : threshold;
 
-			cpu_size = len * fraction_snapshot;
+			cpu_size = len * cpu_size_fraction / 100;
 			dsa_size = len - cpu_size;
 
 			thr_desc.dst_addr = (uint64_t) s + cpu_size + thr_bytes_completed;
@@ -1500,7 +1498,7 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 	if (!is_memcpy && is_overlapping_buffers(dest, src, n))
 		cpu_size = 0;
 	else
-		cpu_size = n * cpu_size_fraction;
+		cpu_size = n * cpu_size_fraction / 100;
 
 	dsa_size = n - cpu_size;
 
@@ -1524,9 +1522,8 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 		}
 	} else {
 		uint32_t threshold;
-		double fraction_snapshot = cpu_size_fraction;
 
-		threshold = wq->max_transfer_size / (1 - fraction_snapshot);
+		threshold = wq->max_transfer_size * 100 / (100 - cpu_size_fraction);
 
 		do {
 			size_t len;
@@ -1536,7 +1533,7 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 			if (!is_memcpy && is_overlapping_buffers(dest, src, len))
 				cpu_size = 0;
 			else
-				cpu_size = len * cpu_size_fraction;
+				cpu_size = len * cpu_size_fraction / 100;
 
 			dsa_size = len - cpu_size;
 
