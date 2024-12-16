@@ -1288,11 +1288,12 @@ static int init_dto(void)
 					dsa_min_size = DTO_DEFAULT_MIN_SIZE;
 			}
 
+			double cpu_size_fraction_float = (double)cpu_size_fraction / 100;
 			env_str = getenv("DTO_CPU_SIZE_FRACTION");
 
 			if (env_str != NULL) {
 				errno = 0;
-				double cpu_size_fraction_float = strtod(env_str, NULL);
+				cpu_size_fraction_float = strtod(env_str, NULL);
 
 				if (errno || cpu_size_fraction_float < 0 || cpu_size_fraction_float >= 1) {
 					LOG_ERROR("Invalid DTO_CPU_SIZE_FRACTION %s, "
@@ -1344,7 +1345,7 @@ static int init_dto(void)
 			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
 				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d\n",
 				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
-				cpu_size_fraction, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc);
+				cpu_size_fraction_float, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc);
 			for (int i = 0; i < num_wqs; i++)
 				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx\n", i,
 					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap);
@@ -1436,15 +1437,15 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 		}
 	} else {
 		uint32_t threshold;
-
-		threshold = wq->max_transfer_size * 100 / (100 - cpu_size_fraction);
+		size_t current_cpu_size_fraction = cpu_size_fraction;  // the cpu_size_fraction might be changed by the auto tune algorithm 
+		threshold = wq->max_transfer_size * 100 / (100 - current_cpu_size_fraction);
 
 		do {
 			size_t len;
 
 			len = n <= threshold ? n : threshold;
 
-			cpu_size = len * cpu_size_fraction / 100;
+			cpu_size = len * current_cpu_size_fraction / 100;
 			dsa_size = len - cpu_size;
 
 			thr_desc.dst_addr = (uint64_t) s + cpu_size + thr_bytes_completed;
@@ -1522,9 +1523,8 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 		}
 	} else {
 		uint32_t threshold;
-
-		threshold = wq->max_transfer_size * 100 / (100 - cpu_size_fraction);
-
+		size_t current_cpu_size_fraction = cpu_size_fraction;  // the cpu_size_fraction might be changed by the auto tune algorithm 
+		threshold = wq->max_transfer_size * 100 / (100 - current_cpu_size_fraction);
 		do {
 			size_t len;
 
@@ -1533,7 +1533,7 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 			if (!is_memcpy && is_overlapping_buffers(dest, src, len))
 				cpu_size = 0;
 			else
-				cpu_size = len * cpu_size_fraction / 100;
+				cpu_size = len * current_cpu_size_fraction / 100;
 
 			dsa_size = len - cpu_size;
 

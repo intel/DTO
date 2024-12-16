@@ -17,6 +17,10 @@ install:
 	ln -sf /usr/lib64/libdto.so.1.0 /usr/lib64/libdto.so.1
 	ln -sf /usr/lib64/libdto.so.1.0 /usr/lib64/libdto.so
 
+install-local:
+	ln -sf ./libdto.so.1.0 ./libdto.so.1
+	ln -sf ./libdto.so.1.0 ./libdto.so
+
 dto-test: dto-test.c
 	gcc -g dto-test.c $(DML_LIB_CXX) -o dto-test -ldto -lpthread
 
