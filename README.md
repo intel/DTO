@@ -45,7 +45,7 @@ Following environment variables control the behavior of DTO library:
 	DTO_COLLECT_STATS=0/1, 1 (enables stats collection - #of operations, avg latency for each API, etc.>, 0 (disables stats collection).
 				Should be enabled for debugging/profiling only, not for perf evaluation (enabling it slows down the workload). Default is 0.
 	DTO_WAIT_METHOD=<yield,busypoll,umwait> (specifies the method to use while waiting for DSA to complete operation, default is yield)
-	DTO_MIN_BYTES=xxxx (specifies minimum size of API call needed for DSA operation execution, default is 8192 bytes)
+	DTO_MIN_BYTES=xxxx (specifies minimum size of API call needed for DSA operation execution, default is 16384 bytes)
 	DTO_CPU_SIZE_FRACTION=0.xx (specifies fraction of job performed by CPU, in parallel to DSA). Default is 0.00
 	DTO_AUTO_ADJUST_KNOBS=0/1 (disables/enables auto tuning of cpu_size_fraction and dsa_min_bytes parameters. 0 -- disable, 1 -- enable (default))
    DTO_IS_NUMA_AWARE=0/1/2 (disables/buffer-centric/cpu-centric numa awareness. 0 -- disable (default), 1 -- buffer-centric, 2 - cpu-centric)
@@ -168,3 +168,15 @@ Byte Range        -- set      cpy      mov      cmp      set      cpy      mov  
   999424-1003519  -- 0        0        0        0        0        28.42    0        0        0        0        0        0
    >=2093056      -- 0        422.15   0        0        0        0        0        0        0        272.87   0        0
 
+## Usage Notes
+
+When linking DTO using LD_PRELOAD environment variable special care is required when the application is called from within a shell script.
+   - It is best to set the LD_PRELOAD variable as close to the invocation of the actual application. For environments that use nested shell scripts
+     calls, it is ideal to set LD_PRELOAD within the script that invokes the application, and not in outer scripts.
+   - Setting the LD_PRELOAD variable before invoking the shell script which eventually invokes the application can lead to the following problems:
+      - Some shell commands rely on stdout output, for example the output of 'pwd', to set internal variables or environment variables. Setting 
+        DTO_LOG_LEVEL > 0 can cause problems because text output by DTO can be interspersed with output from the shell script causing errors 
+        in the script.
+      - When the application is started by a script with #!<location of shell> which invokes another script with #!<location of shell>, for 
+        unknown reasons DTO causes a segmentation fault during a memset operation on an 8K sized buffer. This can be avoided by setting the minimum 
+        DTO size above 8K, or by avoiding this invocation sequence.

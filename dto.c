@@ -44,7 +44,7 @@
  */
 #define MAX_WQS 32
 #define MAX_NUMA_NODES 32
-#define DTO_DEFAULT_MIN_SIZE 8192
+#define DTO_DEFAULT_MIN_SIZE 16384
 #define DTO_INITIALIZED 0
 #define DTO_INITIALIZING 1
 
@@ -1288,7 +1288,7 @@ static int init_dto(void)
 					dsa_min_size = DTO_DEFAULT_MIN_SIZE;
 			}
 
-			double cpu_size_fraction_float = (double)cpu_size_fraction / 100;
+			double cpu_size_fraction_float = 0.0;
 			env_str = getenv("DTO_CPU_SIZE_FRACTION");
 
 			if (env_str != NULL) {
