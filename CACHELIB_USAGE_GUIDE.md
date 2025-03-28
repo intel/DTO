@@ -136,7 +136,7 @@ DTO_DSA_CC=0 // Set to 0 to bypass CPU cache for the destination buffer, this wi
 
 ```sh
 source ~/DTO/dto_cachelib_env.sh
-./opt/cachelib/bin/cachebench --json_test_config ~/DTO/sample_cachebench_config.json
+./opt/cachelib/bin/cachebench --json_test_config ~/DTO/cachebench_config.json
 ```
 
 ### Additional References
