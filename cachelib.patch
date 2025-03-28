@@ -1,0 +1,55 @@
+From eaa6ded0b338f6b1accf82b35393fef8c8b03ba2 Mon Sep 17 00:00:00 2001
+From: Daniel Byrne <byrnedj12@gmail.com>
+Date: Wed, 12 Mar 2025 04:49:29 -0700
+Subject: [PATCH] dto enable
+
+---
+ cachelib/CMakeLists.txt            | 2 ++
+ cachelib/cachebench/CMakeLists.txt | 4 ++++
+ cachelib/cachebench/cache/Cache.h  | 2 +-
+ 3 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/cachelib/CMakeLists.txt b/cachelib/CMakeLists.txt
+index 506ba66b..07aef841 100644
+--- a/cachelib/CMakeLists.txt
++++ b/cachelib/CMakeLists.txt
+@@ -44,6 +44,8 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+ 
+ option(BUILD_TESTS "If enabled, compile the tests." ON)
+ 
++option(BUILD_WITH_DTO "If enabled, build with the DTO library for DSA support." ON)
++
+ 
+ set(BIN_INSTALL_DIR bin CACHE STRING
+     "The subdirectory where binaries should be installed")
+diff --git a/cachelib/cachebench/CMakeLists.txt b/cachelib/cachebench/CMakeLists.txt
+index f08e08f5..349b71f7 100644
+--- a/cachelib/cachebench/CMakeLists.txt
++++ b/cachelib/cachebench/CMakeLists.txt
+@@ -72,6 +72,10 @@ add_executable (binary_trace_gen binary_trace_gen.cpp)
+ target_link_libraries(cachebench cachelib_cachebench)
+ target_link_libraries(binary_trace_gen cachelib_binary_trace_gen)
+ 
++if (BUILD_WITH_DTO)
++    target_link_libraries(cachebench accel-config dto)
++endif ()
++
+ install(
+   TARGETS
+      cachebench
+diff --git a/cachelib/cachebench/cache/Cache.h b/cachelib/cachebench/cache/Cache.h
+index 17a4dc15..effacac8 100644
+--- a/cachelib/cachebench/cache/Cache.h
++++ b/cachelib/cachebench/cache/Cache.h
+@@ -1330,7 +1330,7 @@ void Cache<Allocator>::setStringItem(WriteHandle& handle,
+     return;
+ 
+   auto ptr = reinterpret_cast<char*>(getMemory(handle));
+-  std::strncpy(ptr, str.c_str(), dataSize);
++  std::memmove(ptr, str.c_str(), dataSize);
+ 
+   // Make sure the copied string ends with null char
+   if (str.size() + 1 > dataSize) {
+-- 
+2.47.1
+

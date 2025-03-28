@@ -1,0 +1,9 @@
+#!/bin/bash
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+export DTO_USESTDC_CALLS=0
+export DTO_COLLECT_STATS=0
+export DTO_WAIT_METHOD=sleep
+export DTO_MIN_BYTES=32768
+export DTO_CPU_SIZE_FRACTION=0.0
+export DTO_AUTO_ADJUST_KNOBS=0
+export DTO_DSA_CC=0
