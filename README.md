@@ -26,6 +26,13 @@ To improve throughput for synchronous offload, DTO uses "pseudo asynchronous" ex
    calling thread cpu - cpu-centric numa awareness.
 3) In parallel, DTO performs the CPU portion of the job using std library on CPU.
 4) DTO waits for DSA to complete (if it hasn't completed already). The wait method can be configured using an environment variable DTO_WAIT_METHOD.
+   The wait method can be one of the following: yield, busypoll, umwait, or tpause. The default is is busypoll.
+
+For some workloads, complete offloading to the DSA device can result in improved performance and reduce power consumption via the UMWAIT (or TPAUSE) instruction.
+In this case, DTO_CPU_SIZE_FRACTION can be set to 0.0, which means that the CPU job is 0 bytes and the entire job is offloaded to DSA and AUTO_ADJUST_KNOBS is set to 0.
+Then during the wait step, DTO will use the UMWAIT (or TPAUSE) instruction to wait for the DSA job to complete. UMWAIT / TPAUSE are instructions that allow the CPU to enter a low-power state while waiting for the job to complete. For UMWAIT, please refer to this [enabling guide](https://www.intel.com/content/www/us/en/developer/articles/technical/software-security-guidance/technical-documentation/monitor-umonitor-performance-guidance.html) for more details.
+
+
 
 DTO also implements a heuristic to auto tune dsa_min_bytes and cpu_size_fraction parameters based on current DSA load. For example, if DSA is heavily loaded,
 DTO tries to reduce the DSA load by increasing cpu_size_fraction and dsa_min_bytes. Conversely, if DSA is lightly loaded, DTO tries to increase the DSA load by
