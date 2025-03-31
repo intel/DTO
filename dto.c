@@ -32,8 +32,10 @@
 #define GENCAP_CC_MEMORY  0x4
 
 #define UMWAIT_DELAY_DEFAULT 100000
-/* C0.1 state */
-#define UMWAIT_STATE 1
+
+#define C01_STATE 1
+#define C02_STATE 0
+#define TPAUSE_DELAY 1000
 
 #define USE_ORIG_FUNC(n, use_dsa) (use_std_lib_calls == 1 || !use_dsa || n < dsa_min_size)
 #define TS_NS(s, e) (((e.tv_sec*1000000000) + e.tv_nsec) - ((s.tv_sec*1000000000) + s.tv_nsec))
@@ -45,7 +47,8 @@
  */
 #define MAX_WQS 32
 #define MAX_NUMA_NODES 32
-#define DTO_DEFAULT_MIN_SIZE 16384
+#define DTO_DEFAULT_MIN_SIZE 32768
+#define DTO_DEFAULT_USLEEP 20
 #define DTO_INITIALIZED 0
 #define DTO_INITIALIZING 1
 
@@ -81,6 +84,7 @@ enum wait_options {
 	WAIT_BUSYPOLL = 0,
 	WAIT_UMWAIT,
 	WAIT_YIELD,
+	WAIT_TPAUSE,
         WAIT_SLEEP
 };
 
@@ -116,6 +120,9 @@ static uint8_t dto_dsa_memset = 1;
 static uint8_t dto_dsa_memcmp = 1;
 
 static uint8_t dto_dsa_cc = 1;
+static bool dto_use_c02 = true; //C02 state is default -
+                            //C02 avg exit latency is ~500 ns
+                            //and C01 is about ~240 ns on SPR
 
 static unsigned long dto_umwait_delay = UMWAIT_DELAY_DEFAULT;
 
@@ -173,6 +180,7 @@ static const char * const wait_names[] = {
 	[WAIT_BUSYPOLL] = "busypoll",
 	[WAIT_UMWAIT] = "umwait",
 	[WAIT_YIELD] = "yield",
+        [WAIT_TPAUSE] = "tpause",
         [WAIT_SLEEP] = "sleep"
 };
 
@@ -344,72 +352,92 @@ static __always_inline int umwait(unsigned long timeout, unsigned int state)
 	return r;
 }
 
+static inline void tpause(unsigned long timeout, unsigned int state)
+{
+    uint32_t timeout_low = (uint32_t)(timeout);
+    uint32_t timeout_high = (uint32_t)(timeout >> 32);
+    asm volatile(".byte 0x66, 0x0f, 0xae, 0xf1\t\n"
+             :
+             : "c"(state), "a"(timeout_low), "d"(timeout_high));
+}
+
+
 static __always_inline void dsa_wait_yield(const volatile uint8_t *comp)
 {
 	while (*comp == 0) {
-		sched_yield();
+	    sched_yield();
 	}
 }
 
 static __always_inline void dsa_wait_busy_poll(const volatile uint8_t *comp)
 {
 	while (*comp == 0) {
-		_mm_pause();
+	    _mm_pause();
+	}
+}
+
+static __always_inline void dsa_wait_tpause(const volatile uint8_t *comp)
+{
+	while (*comp == 0) {
+            tpause(__rdtsc() + TPAUSE_DELAY,
+	    dto_use_c02 ? C02_STATE : C01_STATE); //default is 1000 cycles
 	}
 }
 
 static __always_inline void __dsa_wait_umwait(const volatile uint8_t *comp)
 {
 	umonitor(comp);
-
-	// Hardware never writes 0 to this field. Software should initialize this field to 0
-	// so it can detect when the completion record has been written
-	if (*comp == 0) {
-		uint64_t delay = __rdtsc() + dto_umwait_delay;
-
-		umwait(delay, UMWAIT_STATE);
-	}
+	
+        uint64_t delay = __rdtsc() + dto_umwait_delay;
+	umwait(delay, dto_use_c02 ? C02_STATE : C01_STATE);
 }
 
 static __always_inline void dsa_wait_umwait(const volatile uint8_t *comp)
 {
 
-	while (*comp == 0)
-		__dsa_wait_umwait(comp);
+	while (*comp == 0) {
+	    __dsa_wait_umwait(comp);
+        }
 }
 
 static __always_inline void __dsa_wait(const volatile uint8_t *comp)
 {
-	if (wait_method == WAIT_YIELD)
+        switch(wait_method) {
+            case WAIT_YIELD:
 		sched_yield();
-	else if (wait_method == WAIT_UMWAIT)
-		__dsa_wait_umwait(comp);
-	else
-		_mm_pause();
+                break;
+            case WAIT_UMWAIT:
+                __dsa_wait_umwait(comp);
+                break;
+            case WAIT_TPAUSE:
+                tpause(__rdtsc() + TPAUSE_DELAY,
+			dto_use_c02 ? C02_STATE : C01_STATE); //default is 1000 cycles
+                break;
+            default:
+                 _mm_pause();
+        }
 }
 
 static __always_inline void dsa_wait_no_adjust(const volatile uint8_t *comp)
 {
     switch (wait_method) {
-    case WAIT_YIELD:
-        dsa_wait_yield(comp);
-        break;
-    case WAIT_UMWAIT:
-        dsa_wait_umwait(comp);
-        break;
-    case WAIT_BUSYPOLL:
-        dsa_wait_busy_poll(comp);
-        break;
-    case WAIT_SLEEP:
-        // This method is not typically used in high-performance scenarios,
-        // but included for completeness. It can be implemented with a sleep.
-        // For example, using usleep or sleep for a short duration.
-        // This is a placeholder for actual sleep implementation.
-        do {
-            usleep(20); // Sleep for 20 microseconds
-        } while (*comp == 0);
-    default:
-        dsa_wait_busy_poll(comp);
+        case WAIT_YIELD:
+            dsa_wait_yield(comp);
+            break;
+        case WAIT_UMWAIT:
+            dsa_wait_umwait(comp);
+            break;
+        case WAIT_BUSYPOLL:
+            dsa_wait_busy_poll(comp);
+            break;
+        case WAIT_SLEEP:
+            // This method is not typically used in high-performance scenarios but
+            // gives a good demonstration of how much CPU time can be reduced
+            do {
+                usleep(DTO_DEFAULT_USLEEP); // Sleep for 20 microseconds
+            } while (*comp == 0);
+        default:
+            dsa_wait_busy_poll(comp);
     }
 }
 
@@ -437,8 +465,9 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp)
 	uint64_t local_num_waits = 0;
 
 	if ((++num_descs & DESCS_PER_RUN) != DESCS_PER_RUN) {
-		while (*comp == 0)
+		while (*comp == 0) {
 			__dsa_wait(comp);
+                }
 
 		return;
 	}
@@ -1140,7 +1169,21 @@ static int dsa_init(void)
 				max_avg_waits = MAX_AVG_POLL_WAITS;
 			} else
 				LOG_ERROR("umwait not supported. Falling back to default wait method\n");
-		}
+		} else if (!strncmp(env_str, wait_names[WAIT_TPAUSE], strlen(wait_names[WAIT_TPAUSE]))) {
+		    if (umwait_support) {
+			wait_method = WAIT_TPAUSE;
+                    } else {
+			LOG_ERROR("tpause not supported. Falling back to busypoll\n");
+                        wait_method = WAIT_BUSYPOLL;
+                    }
+                } else if (!strncmp(env_str, wait_names[WAIT_SLEEP], strlen(wait_names[WAIT_SLEEP]))) {
+                    if (cpu_size_fraction == 0.0 && auto_adjust_knobs == 0) {
+                        wait_method = WAIT_SLEEP;
+                    } else {
+                        LOG_ERROR("sleep not supported for partial offloading (fraction > 0 and/or autotuning is selected\n");
+                        wait_method = WAIT_BUSYPOLL;
+                    }
+                }
 	}
 
 	env_str = getenv("DTO_WQ_LIST");
