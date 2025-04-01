@@ -80,15 +80,17 @@ sudo accel-config -c <config_file>
 ldd --version
 ```
 - Systems with glibc versions **less than 2.36** may experience reduced DTO performance due to a known bug.
-
+- Centos 10 requires the CRB repo to be enabled for 'accel-config-devel'
 #### Package Requirements
 - **Fedora/CentOS/RHEL**:
 ```sh
+sudo dnf config-manager --set-enabled crb
 sudo dnf install -y \
   kernel-headers \
   accel-config-devel \
-  libuuid-devel \
-  numactl-devel 
+  accel-config \
+  numactl-devel \
+  libuuid-devel
 ```
 - **Ubuntu/Debian**:
 ```sh
