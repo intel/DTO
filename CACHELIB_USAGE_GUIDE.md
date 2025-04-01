@@ -126,7 +126,7 @@ Cachebench needs a change for setStringItem to use 'std::memmove' instead of 'st
 cd ~/CacheLib/
 git apply ~/DTO/cachelib.patch
 cd build-cachelib/
-cmake .. \
+cmake ../cachelib \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DBUILD_WITH_DTO=ON
 make -j$(nproc)
