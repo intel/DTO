@@ -39,7 +39,7 @@
 #define C01_STATE 1
 #define C02_STATE 0
 
-#define USE_ORIG_FUNC(n, use_dsa) (use_std_lib_calls == 1 || !use_dsa || n < dsa_min_size)
+#define USE_ORIG_FUNC(n, use_dsa) (use_std_lib_calls == 1 || !use_dsa || (n*(100-cpu_size_fraction)/100) < dsa_min_size)
 #define TS_NS(s, e) (((e.tv_sec*1000000000) + e.tv_nsec) - ((s.tv_sec*1000000000) + s.tv_nsec))
 
 /* Maximum WQs that DTO will use. It is rather an arbitrary limit
