@@ -23,6 +23,7 @@
 #include <accel-config/libaccel_config.h>
 #include <numaif.h>
 #include <numa.h>
+#include "dto.h"
 
 #define likely(x)       __builtin_expect((x), 1)
 #define unlikely(x)     __builtin_expect((x), 0)
@@ -47,6 +48,10 @@
 #define DTO_DEFAULT_MIN_SIZE 16384
 #define DTO_INITIALIZED 0
 #define DTO_INITIALIZING 1
+
+#define NSEC_PER_SEC (1000000000)
+#define MSEC_PER_SEC (1000)
+#define NSEC_PER_MSEC (NSEC_PER_SEC/MSEC_PER_SEC)
 
 // thread specific variables
 static __thread struct dsa_hw_desc thr_desc;
@@ -107,6 +112,7 @@ static enum numa_aware is_numa_aware;
 static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
 static int wait_method = WAIT_YIELD;
 static size_t cpu_size_fraction;   // range of values is 0 to 99
+static uint64_t wait_time = 100000; //10K nanoseconds
 
 static uint8_t dto_dsa_memcpy = 1;
 static uint8_t dto_dsa_memmove = 1;
@@ -122,6 +128,7 @@ static uint8_t fork_handler_registered;
 enum memop {
 	MEMSET = 0x0,
 	MEMCOPY,
+	MEMCOPY_ASYNC,
 	MEMMOVE,
 	MEMCMP,
 	MAX_MEMOP,
@@ -130,6 +137,7 @@ enum memop {
 static const char * const memop_names[] = {
 	[MEMSET] = "set",
 	[MEMCOPY] = "cpy",
+	[MEMCOPY_ASYNC] = "cpy_async",
 	[MEMMOVE] = "mov",
 	[MEMCMP] = "cmp"
 };
@@ -557,6 +565,7 @@ static void print_stats(void)
 	clock_gettime(CLOCK_BOOTTIME, &dto_end_time);
 
 	LOG_TRACE("DTO Run Time: %ld ms\n", TS_NS(dto_start_time, dto_end_time)/1000000);
+	LOG_TRACE("DTO CPU Fraction: %.2f \n", cpu_size_fraction/100.0);
 
 	// display stats
 	for (int t = 0; t < 2; ++t) {
@@ -1340,6 +1349,23 @@ static int init_dto(void)
 				LOG_ERROR("Didn't find any usable DSAs. Falling back to using CPUs.\n");
 				use_std_lib_calls = 1;
 			}
+    			unsigned int num, den, freq;
+    			unsigned int unused;
+    			unsigned long long tmp;
+    			__get_cpuid( 0x15, &den, &num, &freq, &unused );
+    			freq /= 1000;
+    			LOG_TRACE( "Core Freq = %u kHz\n", freq );
+    			LOG_TRACE( "TSC Mult  = %u\n", num );
+    			LOG_TRACE( "TSC Den   = %u\n", den );
+    			freq *= num;
+    			freq /= den;
+    			LOG_TRACE( "CPU freq = %u kHz\n", freq );
+    			LOG_TRACE( "Requested wait: %llu nsec\n", wait_time );
+    			tmp = wait_time;
+    			tmp *= freq;
+    			wait_time = tmp / NSEC_PER_MSEC;
+    			LOG_TRACE( "Requested wait duration: %llu cycles\n", wait_time );
+    
 
 			// display configuration
 			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
@@ -1482,6 +1508,56 @@ static bool is_overlapping_buffers (void *dest, const void *src, size_t n)
 		return false;
 
 	return true;
+}
+
+__attribute__((visibility("default"))) void dto_memcpy_async(void *dest, const void *src, size_t n, callback_t cb, void* args) {
+	//submit dsa work if successful, call the callback
+	int result = 0;
+	struct dto_wq *wq = get_wq(dest);
+	size_t dsa_size = n;
+#ifdef DTO_STATS_SUPPORT
+	struct timespec st, et;
+	size_t orig_n = n;
+	DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+	thr_desc.opcode = DSA_OPCODE_MEMMOVE;
+	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
+		thr_desc.flags |= IDXD_OP_FLAG_CC;
+	thr_desc.completion_addr = (uint64_t)&thr_comp;
+
+	thr_bytes_completed = 0;
+
+	thr_desc.src_addr = (uint64_t) src;
+	thr_desc.dst_addr = (uint64_t) dest;
+	thr_desc.xfer_size = (uint32_t) dsa_size;
+	thr_comp.status = 0;
+	result = dsa_submit(wq, &thr_desc);
+	if (result == SUCCESS) {
+		cb(args);
+		result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+	}
+#ifdef DTO_STATS_SUPPORT
+	DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY_ASYNC, n, thr_bytes_completed, result);
+#endif
+	if (thr_bytes_completed != n) {
+		/* fallback to std call if job is only partially completed */
+		n -= thr_bytes_completed;
+		if (thr_comp.result == 0) {
+			dest = (void *)((uint64_t)dest + thr_bytes_completed);
+			src = (const void *)((uint64_t)src + thr_bytes_completed);
+		}
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+		orig_memcpy(dest, src, n);
+
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCOPY, n, orig_n);
+#endif
+	}
 }
 
 static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy, int *result)
