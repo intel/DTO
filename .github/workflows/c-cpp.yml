@@ -23,5 +23,7 @@ jobs:
       run: sudo apt install -y libnuma-dev
     - name: make
       run: make
+    - name: install
+      run: sudo make install
     - name: make dto-test
-      run: make dto-test
+      run: export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib64/; make dto-test
