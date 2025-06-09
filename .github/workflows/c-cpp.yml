@@ -27,3 +27,5 @@ jobs:
       run: sudo make install
     - name: make dto-test
       run: export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib64/; make dto-test
+    - name: run dto-test
+      run: ./dto-test
