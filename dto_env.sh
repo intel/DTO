@@ -1,0 +1,7 @@
+#!/bin/bash
+export DTO_USESTDC_CALLS=0
+export DTO_COLLECT_STATS=1
+export DTO_WAIT_METHOD=umwait
+export DTO_MIN_BYTES=32768
+export DTO_CPU_SIZE_FRACTION=0.0
+export DTO_AUTO_ADJUST_KNOBS=0

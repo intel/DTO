@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <string.h>
@@ -27,14 +28,18 @@
 #define likely(x)       __builtin_expect((x), 1)
 #define unlikely(x)     __builtin_expect((x), 0)
 
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+
 // DSA capabilities
 #define GENCAP_CC_MEMORY  0x4
 
 #define UMWAIT_DELAY_DEFAULT 100000
-/* C0.1 state */
-#define UMWAIT_STATE 1
 
-#define USE_ORIG_FUNC(n, use_dsa) (use_std_lib_calls == 1 || !use_dsa || n < dsa_min_size)
+#define C01_STATE 1
+#define C02_STATE 0
+
+#define USE_ORIG_FUNC(n, use_dsa) (use_std_lib_calls == 1 || !use_dsa || (n*(100-cpu_size_fraction)/100) < dsa_min_size)
 #define TS_NS(s, e) (((e.tv_sec*1000000000) + e.tv_nsec) - ((s.tv_sec*1000000000) + s.tv_nsec))
 
 /* Maximum WQs that DTO will use. It is rather an arbitrary limit
@@ -42,9 +47,11 @@
  * Allocating memory dynamically may create cyclic dependency and may cause
  * a hang (e.g., memset --> malloc --> alloc library calls memset --> memset)
  */
+#define WQ_MMAPPED 1
 #define MAX_WQS 32
 #define MAX_NUMA_NODES 32
-#define DTO_DEFAULT_MIN_SIZE 16384
+#define DTO_DEFAULT_MIN_SIZE 32768
+#define DTO_DEFAULT_USLEEP 20
 #define DTO_INITIALIZED 0
 #define DTO_INITIALIZING 1
 
@@ -79,7 +86,9 @@ struct dto_device {
 enum wait_options {
 	WAIT_BUSYPOLL = 0,
 	WAIT_UMWAIT,
-	WAIT_YIELD
+	WAIT_YIELD,
+	WAIT_TPAUSE,
+        WAIT_SLEEP
 };
 
 enum numa_aware {
@@ -114,6 +123,15 @@ static uint8_t dto_dsa_memset = 1;
 static uint8_t dto_dsa_memcmp = 1;
 
 static uint8_t dto_dsa_cc = 1;
+static bool dto_use_c02 = true; //C02 state is default -
+                            //C02 avg exit latency is ~500 ns
+                            //and C01 is about ~240 ns on SPR
+
+#define TPAUSE_C02_DELAY 10000 //in this case we are offloading so delay can
+                               //be 4~5 us
+
+#define TPAUSE_C01_DELAY 1000 //keep smaller because we want to wake up
+                              //with lower latency
 
 static unsigned long dto_umwait_delay = UMWAIT_DELAY_DEFAULT;
 
@@ -171,6 +189,8 @@ static const char * const wait_names[] = {
 	[WAIT_BUSYPOLL] = "busypoll",
 	[WAIT_UMWAIT] = "umwait",
 	[WAIT_YIELD] = "yield",
+        [WAIT_TPAUSE] = "tpause",
+        [WAIT_SLEEP] = "sleep"
 };
 
 static int collect_stats;
@@ -251,6 +271,20 @@ static unsigned int log_level = LOG_LEVEL_FATAL;
 #define MIN_DSA_MIN_SIZE 6144
 #define DMS_STEP_INCREMENT 1024
 #define DMS_STEP_DECREMENT 1024
+
+/* Auto tune v2 */
+#define KP 0.5
+#define KI 0.1
+#define SAMPLE_INTERVAL 10000
+#define AUTO_ADJUST_KNOBS 1
+#define AUTO_ADJUST_KNOBS_V2 2
+
+#define AUTO_TUNE_V2_TARGET 1
+
+static __thread uint64_t tl_num_descs = 0;
+static __thread uint64_t tl_next_sample = 0;
+static __thread uint64_t tl_integral = 0;
+static __thread uint64_t tl_cpu_size_fraction = 0;
 
 /* Auto tuning variables */
 static atomic_ullong num_descs;
@@ -341,59 +375,95 @@ static __always_inline int umwait(unsigned long timeout, unsigned int state)
 	return r;
 }
 
+static inline void tpause(unsigned long timeout, unsigned int state)
+{
+    uint32_t timeout_low = (uint32_t)(timeout);
+    uint32_t timeout_high = (uint32_t)(timeout >> 32);
+    asm volatile(".byte 0x66, 0x0f, 0xae, 0xf1\t\n"
+             :
+             : "c"(state), "a"(timeout_low), "d"(timeout_high));
+}
+
+
 static __always_inline void dsa_wait_yield(const volatile uint8_t *comp)
 {
 	while (*comp == 0) {
-		sched_yield();
+	    sched_yield();
 	}
 }
 
 static __always_inline void dsa_wait_busy_poll(const volatile uint8_t *comp)
 {
 	while (*comp == 0) {
-		_mm_pause();
+	    _mm_pause();
+	}
+}
+
+static __always_inline void dsa_wait_tpause(const volatile uint8_t *comp)
+{
+	while (*comp == 0) {
+            tpause(__rdtsc() + dto_use_c02 ? TPAUSE_C02_DELAY : TPAUSE_C01_DELAY,
+	    dto_use_c02 ? C02_STATE : C01_STATE);
 	}
 }
 
 static __always_inline void __dsa_wait_umwait(const volatile uint8_t *comp)
 {
 	umonitor(comp);
-
-	// Hardware never writes 0 to this field. Software should initialize this field to 0
-	// so it can detect when the completion record has been written
-	if (*comp == 0) {
-		uint64_t delay = __rdtsc() + dto_umwait_delay;
-
-		umwait(delay, UMWAIT_STATE);
-	}
+	
+        uint64_t delay = __rdtsc() + dto_umwait_delay;
+	umwait(delay, dto_use_c02 ? C02_STATE : C01_STATE);
 }
 
 static __always_inline void dsa_wait_umwait(const volatile uint8_t *comp)
 {
 
-	while (*comp == 0)
-		__dsa_wait_umwait(comp);
+	while (*comp == 0) {
+	    __dsa_wait_umwait(comp);
+        }
 }
 
 static __always_inline void __dsa_wait(const volatile uint8_t *comp)
 {
-	if (wait_method == WAIT_YIELD)
+        switch(wait_method) {
+            case WAIT_YIELD:
 		sched_yield();
-	else if (wait_method == WAIT_UMWAIT)
-		__dsa_wait_umwait(comp);
-	else
-		_mm_pause();
+                break;
+            case WAIT_UMWAIT:
+                __dsa_wait_umwait(comp);
+                break;
+            case WAIT_TPAUSE:
+                tpause(__rdtsc() + dto_use_c02 ? TPAUSE_C02_DELAY : TPAUSE_C01_DELAY,
+			dto_use_c02 ? C02_STATE : C01_STATE);
+                break;
+            default:
+                 _mm_pause();
+        }
 }
 
 static __always_inline void dsa_wait_no_adjust(const volatile uint8_t *comp)
 {
-	if (wait_method == WAIT_YIELD)
-		dsa_wait_yield(comp);
-	else if (wait_method == WAIT_UMWAIT)
-		dsa_wait_umwait(comp);
-	else
-		dsa_wait_busy_poll(comp);
+    switch (wait_method) {
+        case WAIT_YIELD:
+            dsa_wait_yield(comp);
+            break;
+        case WAIT_UMWAIT:
+            dsa_wait_umwait(comp);
+            break;
+        case WAIT_BUSYPOLL:
+            dsa_wait_busy_poll(comp);
+            break;
+        case WAIT_SLEEP:
+            // This method is not typically used in high-performance scenarios but
+            // gives a good demonstration of how much CPU time can be reduced
+            do {
+                usleep(DTO_DEFAULT_USLEEP); // Sleep for 20 microseconds
+            } while (*comp == 0);
+        default:
+            dsa_wait_busy_poll(comp);
+    }
 }
+
 
 /* A simple auto-tuning heuristic.
  * Goal of the Heuristic:
@@ -418,8 +488,9 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp)
 	uint64_t local_num_waits = 0;
 
 	if ((++num_descs & DESCS_PER_RUN) != DESCS_PER_RUN) {
-		while (*comp == 0)
+		while (*comp == 0) {
 			__dsa_wait(comp);
+                }
 
 		return;
 	}
@@ -454,13 +525,42 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp)
 	}
 }
 
+static __always_inline void dsa_wait_and_adjust_v2(const volatile uint8_t *comp)
+{
+
+    if (++tl_num_descs == tl_next_sample) {
+	uint64_t local_num_waits = 0;
+        while (*comp == 0) {
+            __dsa_wait(comp);
+            local_num_waits++;
+        }
+        int64_t error = local_num_waits - AUTO_TUNE_V2_TARGET;
+        tl_integral += error;
+        uint64_t new_frac = tl_cpu_size_fraction - KP * error + KI * tl_integral;
+
+        // Clamp within valid range
+        tl_cpu_size_fraction = MAX(1, MIN(MAX_CPU_SIZE_FRACTION, new_frac));
+        tl_next_sample += rand() % SAMPLE_INTERVAL*2 + 1;
+    } else {
+	while (*comp == 0) {
+	    __dsa_wait(comp);
+        }
+    }
+}
+
 static __always_inline int dsa_wait(struct dto_wq *wq,
 	struct dsa_hw_desc *hw, volatile uint8_t *comp)
 {
-	if (auto_adjust_knobs)
-		dsa_wait_and_adjust(comp);
-	else
-		dsa_wait_no_adjust(comp);
+	switch (auto_adjust_knobs) {
+            case AUTO_ADJUST_KNOBS:
+                dsa_wait_and_adjust(comp);
+                break;
+            case AUTO_ADJUST_KNOBS_V2:
+                dsa_wait_and_adjust_v2(comp);
+                break;
+            default:
+                dsa_wait_no_adjust(comp);
+        }
 
 	if (likely(*comp == DSA_COMP_SUCCESS)) {
 		thr_bytes_completed += hw->xfer_size;
@@ -502,21 +602,32 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
 	//LOG_TRACE("desc flags: 0x%x, opcode: 0x%x\n", hw->flags, hw->opcode);
 	__builtin_ia32_sfence();
 
-	if (wq->wq_mmapped)
+	switch (wq->wq_mmapped) {
+            case WQ_MMAPPED:
 		ret = enqcmd(hw, wq->wq_portal);
-
-	else {
+                break;
+            default:
 		ret = write(wq->wq_fd, hw, sizeof(*hw));
-		if (ret != sizeof(*hw))
+		if (ret != sizeof(*hw)) {
 			return FAIL_OTHERS;
-		else
+                }
+		else {
 			ret = 0;
-	}
+                }
+                break;
+        }
+
 	if (!ret) {
-		if (auto_adjust_knobs)
-			dsa_wait_and_adjust(comp);
-		else
-			dsa_wait_no_adjust(comp);
+	        switch (auto_adjust_knobs) {
+                    case AUTO_ADJUST_KNOBS:
+                        dsa_wait_and_adjust(comp);
+                        break;
+                    case AUTO_ADJUST_KNOBS_V2:
+                        dsa_wait_and_adjust_v2(comp);
+                        break;
+                    default:
+                        dsa_wait_no_adjust(comp);
+                }
 
 		if (*comp == DSA_COMP_SUCCESS) {
 			thr_bytes_completed += hw->xfer_size;
@@ -1121,7 +1232,38 @@ static int dsa_init(void)
 				max_avg_waits = MAX_AVG_POLL_WAITS;
 			} else
 				LOG_ERROR("umwait not supported. Falling back to default wait method\n");
-		}
+		} else if (!strncmp(env_str, wait_names[WAIT_TPAUSE], strlen(wait_names[WAIT_TPAUSE]))) {
+		    if (umwait_support) {
+			wait_method = WAIT_TPAUSE;
+                    } else {
+			LOG_ERROR("tpause not supported. Falling back to busypoll\n");
+                        wait_method = WAIT_BUSYPOLL;
+                    }
+                } else if (!strncmp(env_str, wait_names[WAIT_SLEEP], strlen(wait_names[WAIT_SLEEP]))) {
+                    double local_cpu_size_fraction = 0;
+		    env_str = getenv("DTO_CPU_SIZE_FRACTION");
+
+                    if (env_str != NULL) {
+			    errno = 0;
+			    local_cpu_size_fraction = strtod(env_str, NULL);
+                    }
+
+                    uint64_t local_auto_adjust_knobs = 0;
+	            env_str = getenv("DTO_AUTO_ADJUST_KNOBS");
+
+		    if (env_str != NULL) {
+			errno = 0;
+			local_auto_adjust_knobs = strtoul(env_str, NULL, 10);
+			    if (errno)
+				local_auto_adjust_knobs = 1;
+		    }
+                    if (local_cpu_size_fraction < 0.001 && local_auto_adjust_knobs == 0) {
+                        wait_method = WAIT_SLEEP;
+                    } else {
+                        LOG_ERROR("sleep not supported for partial offloading (fraction > 0 and/or autotuning is selected\n");
+                        wait_method = WAIT_BUSYPOLL;
+                    }
+                }
 	}
 
 	env_str = getenv("DTO_WQ_LIST");
@@ -1303,6 +1445,7 @@ static int init_dto(void)
 				}
 				/* Use only 2 digits after decimal point */
 				cpu_size_fraction = cpu_size_fraction_float * 100;
+                                tl_cpu_size_fraction = cpu_size_fraction;
 			}
 
 			env_str = getenv("DTO_AUTO_ADJUST_KNOBS");
@@ -1312,9 +1455,18 @@ static int init_dto(void)
 				auto_adjust_knobs = strtoul(env_str, NULL, 10);
 				if (errno)
 					auto_adjust_knobs = 1;
-
-				auto_adjust_knobs = !!auto_adjust_knobs;
+                                if (auto_adjust_knobs == AUTO_ADJUST_KNOBS_V2) {
+                                    tl_next_sample = rand() % (SAMPLE_INTERVAL*2) + 1;
+                                }
 			}
+
+                        // Only use c02 if we are offloading a significant chunk to
+                        // DSA so we amortize the exit latency of C02 state
+                        if (cpu_size_fraction <= 20 && auto_adjust_knobs == 0) {
+                            dto_use_c02 = true;
+                        } else {
+                            dto_use_c02 = false;
+                        }
 
 			if (numa_available() != -1) {
 				env_str = getenv("DTO_IS_NUMA_AWARE");
@@ -1343,9 +1495,9 @@ static int init_dto(void)
 
 			// display configuration
 			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
-				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d\n",
+				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d, dto_use_c02: %d\n",
 				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
-				cpu_size_fraction_float, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc);
+				cpu_size_fraction_float, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc, dto_use_c02);
 			for (int i = 0; i < num_wqs; i++)
 				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx\n", i,
 					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap);
@@ -1419,7 +1571,9 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 	thr_desc.pattern = memset_pattern;
 
 	/* cpu_size_fraction guaranteed to be >= 0 and < 100 */
-	cpu_size = n * cpu_size_fraction / 100;
+        uint64_t cpu_frac = auto_adjust_knobs == AUTO_ADJUST_KNOBS_V2 ?
+            tl_cpu_size_fraction : cpu_size_fraction;
+	cpu_size = n * cpu_frac / 100;
 	dsa_size = n - cpu_size;
 
 	thr_bytes_completed = 0;
@@ -1437,7 +1591,7 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 		}
 	} else {
 		uint32_t threshold;
-		size_t current_cpu_size_fraction = cpu_size_fraction;  // the cpu_size_fraction might be changed by the auto tune algorithm 
+		size_t current_cpu_size_fraction = cpu_frac;  // the cpu_size_fraction might be changed by the auto tune algorithm
 		threshold = wq->max_transfer_size * 100 / (100 - current_cpu_size_fraction);
 
 		do {
@@ -1495,11 +1649,14 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 		thr_desc.flags |= IDXD_OP_FLAG_CC;
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
 
+        uint64_t cpu_frac = auto_adjust_knobs == AUTO_ADJUST_KNOBS_V2 ?
+            tl_cpu_size_fraction : cpu_size_fraction;
+
 	/* cpu_size_fraction guaranteed to be >= 0 and < 1 */
 	if (!is_memcpy && is_overlapping_buffers(dest, src, n))
 		cpu_size = 0;
 	else
-		cpu_size = n * cpu_size_fraction / 100;
+		cpu_size = n * cpu_frac / 100;
 
 	dsa_size = n - cpu_size;
 
@@ -1523,7 +1680,7 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 		}
 	} else {
 		uint32_t threshold;
-		size_t current_cpu_size_fraction = cpu_size_fraction;  // the cpu_size_fraction might be changed by the auto tune algorithm 
+		size_t current_cpu_size_fraction = cpu_frac;  // the cpu_size_fraction might be changed by the auto tune algorithm
 		threshold = wq->max_transfer_size * 100 / (100 - current_cpu_size_fraction);
 		do {
 			size_t len;
