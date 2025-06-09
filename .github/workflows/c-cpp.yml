@@ -17,6 +17,8 @@ jobs:
     - uses: actions/checkout@v4
     - name: Install accel-config
       run: sudo apt install -y accel-config libaccel-config-dev
+    - name: Install uuid
+      run: sudo apt install -y uuid-dev
     - name: make
       run: make
     - name: make dto-test
