@@ -1,4 +1,6 @@
-name: C/C++ CI
+name: CI
+permissions: read-all
+
 
 on:
   push:
@@ -13,7 +15,17 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-    - name: make
+    - name: Install accel-config
+      run: sudo apt install -y accel-config libaccel-config-dev
+    - name: Install uuid
+      run: sudo apt install -y uuid-dev
+    - name: Install libnuma
+      run: sudo apt install -y libnuma-dev
+    - name: Build
       run: make
-    - name: make dto-test
-      run: make dto-test
+    - name: Install DTO
+      run: sudo make install
+    - name: Build dto-test
+      run: export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib64/; make dto-test
+    - name: Run dto-test
+      run: LD_LIBRARY_PATH=/usr/lib64 ./dto-test
