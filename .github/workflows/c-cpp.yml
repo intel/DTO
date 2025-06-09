@@ -1,0 +1,22 @@
+name: CI
+permissions: read-all
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install accel-config
+      run: sudo apt install -y accel-config libaccel-config-dev
+    - name: make
+      run: make
+    - name: make dto-test
+      run: make dto-test
