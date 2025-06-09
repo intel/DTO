@@ -19,13 +19,13 @@ jobs:
       run: sudo apt install -y accel-config libaccel-config-dev
     - name: Install uuid
       run: sudo apt install -y uuid-dev
-    - name: Install libnum
+    - name: Install libnuma
       run: sudo apt install -y libnuma-dev
-    - name: make
+    - name: Build
       run: make
-    - name: install
+    - name: Install DTO
       run: sudo make install
-    - name: make dto-test
+    - name: Build dto-test
       run: export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib64/; make dto-test
-    - name: run dto-test
-      run: ./dto-test
+    - name: Run dto-test
+      run: LD_LIBRARY_PATH=/usr/lib64 ./dto-test
