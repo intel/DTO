@@ -19,6 +19,8 @@ jobs:
       run: sudo apt install -y accel-config libaccel-config-dev
     - name: Install uuid
       run: sudo apt install -y uuid-dev
+    - name: Install libnum
+      run: sudo apt install -y libnuma-dev
     - name: make
       run: make
     - name: make dto-test
