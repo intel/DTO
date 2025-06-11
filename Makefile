@@ -16,6 +16,7 @@ install:
 	cp libdto.so.1.0 /usr/lib64/
 	ln -sf /usr/lib64/libdto.so.1.0 /usr/lib64/libdto.so.1
 	ln -sf /usr/lib64/libdto.so.1.0 /usr/lib64/libdto.so
+	cp dto.h /usr/include/
 
 install-local:
 	ln -sf ./libdto.so.1.0 ./libdto.so.1
