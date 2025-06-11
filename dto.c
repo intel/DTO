@@ -89,6 +89,12 @@ enum numa_aware {
 	NA_LAST_ENTRY
 };
 
+enum overlapping_memmove_actions {
+	OVERLAPPING_CPU = 0,
+	OVERLAPPING_DSA,
+	OVERLAPPING_LAST_ENTRY
+};
+
 static const char * const numa_aware_names[] = {
 	[NA_NONE] = "none",
 	[NA_BUFFER_CENTRIC] = "buffer-centric",
@@ -116,6 +122,8 @@ static uint8_t dto_dsa_memcmp = 1;
 static uint8_t dto_dsa_cc = 1;
 
 static unsigned long dto_umwait_delay = UMWAIT_DELAY_DEFAULT;
+
+static uint8_t dto_overlapping_memmove_action = OVERLAPPING_CPU;
 
 static uint8_t fork_handler_registered;
 
@@ -188,7 +196,7 @@ static struct timespec dto_start_time;
 	} while (0)						\
 
 
-#define DTO_COLLECT_STATS_DSA_END(cs, st, et, op, n, tbc, r)				\
+#define DTO_COLLECT_STATS_DSA_END(cs, st, et, op, n, overlap, tbc, r)				\
 	do {										\
 		if (unlikely(cs)) {							\
 			uint64_t t;							\
@@ -196,9 +204,9 @@ static struct timespec dto_start_time;
 			t = (((et.tv_sec*1000000000) + et.tv_nsec) -			\
 					((st.tv_sec*1000000000) + st.tv_nsec));		\
 			if (unlikely(r != SUCCESS))					\
-				update_stats(op, n, tbc, t, DSA_CALL_FAILED, r);	\
+				update_stats(op, n, overlap, tbc, t, DSA_CALL_FAILED, r);	\
 			else								\
-				update_stats(op, n, tbc, t, DSA_CALL_SUCCESS, 0);	\
+				update_stats(op, n, overlap, tbc, t, DSA_CALL_SUCCESS, 0);	\
 		}									\
 	} while (0)									\
 
@@ -209,7 +217,7 @@ static struct timespec dto_start_time;
 			clock_gettime(CLOCK_BOOTTIME, &et);			\
 			t = (((et.tv_sec*1000000000) + et.tv_nsec) -		\
 				((st.tv_sec*1000000000) + st.tv_nsec));		\
-			update_stats(op, orig_n, n, t, STDC_CALL, 0);		\
+			update_stats(op, orig_n, 0, n, t, STDC_CALL, 0);		\
 		}								\
 	} while (0)								\
 
@@ -513,10 +521,7 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
 			ret = 0;
 	}
 	if (!ret) {
-		if (auto_adjust_knobs)
-			dsa_wait_and_adjust(comp);
-		else
-			dsa_wait_no_adjust(comp);
+		dsa_wait_no_adjust(comp);
 
 		if (*comp == DSA_COMP_SUCCESS) {
 			thr_bytes_completed += hw->xfer_size;
@@ -532,9 +537,13 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
 }
 
 #ifdef DTO_STATS_SUPPORT
-static void update_stats(int op, size_t n, size_t bytes_completed,
+static void update_stats(int op, size_t n, uint8_t overlapping, size_t bytes_completed,
 		uint64_t elapsed_ns, int group, int error_code)
 {
+	// dto_memcpymove didn't actually submit the request to DSA, so there is nothing to log. This will be captured by a second call
+	if(op==MEMMOVE && overlapping && dto_overlapping_memmove_action==OVERLAPPING_CPU && group==DSA_CALL_SUCCESS)
+		return;
+
 	int bucket = (n / HIST_BUCKET_SIZE);
 
 	if (bucket >= HIST_NO_BUCKETS)  /* last bucket includes remaining sizes */
@@ -1240,6 +1249,14 @@ static int init_dto(void)
 			dto_dsa_memcmp = !!dto_dsa_memcmp;
 		}
 
+		env_str = getenv("DTO_OVERLAPPING_MEMMOVE_ACTION");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_overlapping_memmove_action = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_overlapping_memmove_action = OVERLAPPING_CPU;
+		}
+
 #ifdef DTO_STATS_SUPPORT
 		env_str = getenv("DTO_COLLECT_STATS");
 		if (env_str != NULL) {
@@ -1484,10 +1501,11 @@ static bool is_overlapping_buffers (void *dest, const void *src, size_t n)
 	return true;
 }
 
-static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy, int *result)
+static uint8_t dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy, int *result)
 {
 	struct dto_wq *wq = get_wq(dest);
 	size_t cpu_size, dsa_size;
+	uint8_t is_overlapping = 0;
 
 	thr_desc.opcode = DSA_OPCODE_MEMMOVE;
 	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
@@ -1496,75 +1514,99 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
 
 	/* cpu_size_fraction guaranteed to be >= 0 and < 1 */
-	if (!is_memcpy && is_overlapping_buffers(dest, src, n))
+	if (!is_memcpy && is_overlapping_buffers(dest, src, n)) {
 		cpu_size = 0;
-	else
+		is_overlapping = 1;
+	} else {
 		cpu_size = n * cpu_size_fraction / 100;
+	}
 
 	dsa_size = n - cpu_size;
 
 	thr_bytes_completed = 0;
 
-	if (dsa_size <= wq->max_transfer_size) {
-		thr_desc.src_addr = (uint64_t) src + cpu_size;
-		thr_desc.dst_addr = (uint64_t) dest + cpu_size;
-		thr_desc.xfer_size = (uint32_t) dsa_size;
-		thr_comp.status = 0;
-		*result = dsa_submit(wq, &thr_desc);
-		if (*result == SUCCESS) {
-			if (cpu_size) {
-				if (is_memcpy)
-					orig_memcpy(dest, src, cpu_size);
-				else
-					orig_memmove(dest, src, cpu_size);
-				thr_bytes_completed += cpu_size;
-			}
-			*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
-		}
+	// If this is an overlapping memmove and the action is to perform on CPU, return having done nothing and
+	// memmove will perform the copy and correctly attribute statistics to stdlib call group
+	if (is_overlapping && dto_overlapping_memmove_action == OVERLAPPING_CPU) {
+		thr_bytes_completed = 0;
+		*result = SUCCESS;
 	} else {
-		uint32_t threshold;
-		size_t current_cpu_size_fraction = cpu_size_fraction;  // the cpu_size_fraction might be changed by the auto tune algorithm 
-		threshold = wq->max_transfer_size * 100 / (100 - current_cpu_size_fraction);
-		do {
-			size_t len;
 
-			len = n <= threshold ? n : threshold;
-
-			if (!is_memcpy && is_overlapping_buffers(dest, src, len))
-				cpu_size = 0;
-			else
-				cpu_size = len * current_cpu_size_fraction / 100;
-
-			dsa_size = len - cpu_size;
-
-			thr_desc.src_addr = (uint64_t) src + cpu_size + thr_bytes_completed;
-			thr_desc.dst_addr = (uint64_t) dest + cpu_size + thr_bytes_completed;
+		if (dsa_size <= wq->max_transfer_size) {
+			thr_desc.src_addr = (uint64_t) src + cpu_size;
+			thr_desc.dst_addr = (uint64_t) dest + cpu_size;
 			thr_desc.xfer_size = (uint32_t) dsa_size;
 			thr_comp.status = 0;
-			*result = dsa_submit(wq, &thr_desc);
-			if (*result == SUCCESS) {
-				if (cpu_size) {
-					const void *src1 = src + thr_bytes_completed;
-					void *dest1 = dest + thr_bytes_completed;
-
-					if (is_memcpy)
-						orig_memcpy(dest1, src1, cpu_size);
-					else
-						orig_memmove(dest1, src1, cpu_size);
-					thr_bytes_completed += cpu_size;
+			if (is_overlapping){
+				*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
+			} else {
+				*result = dsa_submit(wq, &thr_desc);
+				if (*result == SUCCESS) {
+					if (cpu_size) {
+						if (is_memcpy)
+							orig_memcpy(dest, src, cpu_size);
+						else
+							orig_memmove(dest, src, cpu_size);
+						thr_bytes_completed += cpu_size;
+					}
+					*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
 				}
-				*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+			}
+		} else {
+			uint32_t threshold;
+			size_t current_cpu_size_fraction = cpu_size_fraction;  // the cpu_size_fraction might be changed by the auto tune algorithm 
+			if (is_overlapping) {
+				threshold = wq->max_transfer_size;
+				cpu_size = 0;
+			} else {
+				threshold = wq->max_transfer_size * 100 / (100 - current_cpu_size_fraction);
 			}
 
-			if (*result != SUCCESS)
-				break;
-			n -= len;
-			/* If remaining bytes are less than dsa_min_size,
-			 * dont submit to DSA. Instead, complete remaining
-			 * bytes on CPU
-			 */
-		} while (n >= dsa_min_size);
+			do {
+				size_t len;
+
+				len = n <= threshold ? n : threshold;
+
+				if (!is_overlapping)
+					cpu_size = len * current_cpu_size_fraction / 100;
+
+				dsa_size = len - cpu_size;
+
+				thr_desc.src_addr = (uint64_t) src + cpu_size + thr_bytes_completed;
+				thr_desc.dst_addr = (uint64_t) dest + cpu_size + thr_bytes_completed;
+				thr_desc.xfer_size = (uint32_t) dsa_size;
+				thr_comp.status = 0;
+				if (is_overlapping){
+					*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
+				} else {
+					*result = dsa_submit(wq, &thr_desc);
+					if (*result == SUCCESS) {
+						if (cpu_size) {
+							const void *src1 = src + thr_bytes_completed;
+							void *dest1 = dest + thr_bytes_completed;
+
+							if (is_memcpy)
+								orig_memcpy(dest1, src1, cpu_size);
+							else
+								orig_memmove(dest1, src1, cpu_size);
+							thr_bytes_completed += cpu_size;
+						}
+						*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+					}
+				}
+
+				if (*result != SUCCESS)
+					break;
+				n -= len;
+				/* If remaining bytes are less than dsa_min_size,
+				* dont submit to DSA. Instead, complete remaining
+				* bytes on CPU
+				*/
+			} while (n >= dsa_min_size);
+		}
 	}
+
+	return is_overlapping;
 }
 
 static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
@@ -1694,7 +1736,7 @@ void *memset(void *s1, int c, size_t n)
 		dto_memset(s1, c, n, &result);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMSET, n, thr_bytes_completed, result);
+		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMSET, n, 0, thr_bytes_completed, result);
 #endif
 		if (thr_bytes_completed != n) {
 			/* fallback to std call if job is only partially completed */
@@ -1744,7 +1786,7 @@ void *memcpy(void *dest, const void *src, size_t n)
 		dto_memcpymove(dest, src, n, 1, &result);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY, n, thr_bytes_completed, result);
+		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY, n, 0, thr_bytes_completed, result);
 #endif
 		if (thr_bytes_completed != n) {
 			/* fallback to std call if job is only partially completed */
@@ -1776,6 +1818,7 @@ void *memmove(void *dest, const void *src, size_t n)
 	int result = 0;
 	void *ret = dest;
 	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memmove);
+	uint8_t is_overlapping;
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
@@ -1794,10 +1837,10 @@ void *memmove(void *dest, const void *src, size_t n)
 #ifdef DTO_STATS_SUPPORT
 		DTO_COLLECT_STATS_START(collect_stats, st);
 #endif
-		dto_memcpymove(dest, src, n, 0, &result);
+		is_overlapping = dto_memcpymove(dest, src, n, 0, &result);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMMOVE, n, thr_bytes_completed, result);
+		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMMOVE, n, is_overlapping, thr_bytes_completed, result);
 #endif
 		if (thr_bytes_completed != n) {
 			/* fallback to std call if job is only partially completed */
@@ -1850,7 +1893,7 @@ int memcmp(const void *s1, const void *s2, size_t n)
 		ret = dto_memcmp(s1, s2, n, &result);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCMP, n, thr_bytes_completed, result);
+		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCMP, n, 0, thr_bytes_completed, result);
 #endif
 		if (thr_bytes_completed != n) {
 			/* fallback to std call if job is only partially completed */
