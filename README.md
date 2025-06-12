@@ -63,7 +63,7 @@ Following environment variables control the behavior of DTO library:
 
 Although not the only usage models of DTO, the following are some common ones:
    Latency reduction - the goal is to minimize the latency of offloaded operations. Use the following settings:
-      DTO_AUTO_ADJUST_KNOBS=1 (the CPU fraction setting is critical to this mode. The optimal value is dynamic so autotune algorithm nees to be enabled) 
+      DTO_AUTO_ADJUST_KNOBS=1 (the CPU fraction setting is critical to this mode. The optimal value is dynamic so autotune algorithm needs to be enabled) 
       DTO_WAIT_METHOD=busypoll 
 
    Power Reduction - the goal is to reduce power by offloading memory operations to DSA allowing the cpu core to go into a lower power state. This mode may reduce or increase the latency of operations depending on the load on DSA devices.
