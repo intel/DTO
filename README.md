@@ -56,6 +56,7 @@ Following environment variables control the behavior of DTO library:
    DTO_DSA_MEMSET=0/1, 1 (default) - DTO uses DSA to process memset, 0 - DTO use system memset
    DTO_DSA_MEMCMP=0/1, 1 (default) - DTO uses DSA to process memcmp, 0 - DTO use system memcmp
    DTO_DSA_CC=0/1, 1 (default) - DTO sets DSA Cache Control flag to 1 if DSA supports cache control, 0 - DTO sets DSA Cache Control flag to 0
+   DTO_OVERLAPPING_MEMMOVE_ACTION=0/1 0 (default) DTO submits memmove operations with overlapping buffers entirely to CPU, 1 - entirely to DSA
    DTO_UMWAIT_DELAY=xxxx defines delay for umwait command (check max possible value at: /sys/devices/system/cpu/umwait_control/max_time), default is 100000
 	DTO_LOG_FILE=<dto log file path> Redirect the DTO output to the specified file instead of std output (useful for debugging and statistics collection). file name is suffixed by process pid.
 	DTO_LOG_LEVEL=0/1/2 controls the log level. higher value means more verbose logging (default 0).
