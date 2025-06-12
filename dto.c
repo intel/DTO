@@ -44,7 +44,7 @@
  */
 #define MAX_WQS 32
 #define MAX_NUMA_NODES 32
-#define DTO_DEFAULT_MIN_SIZE 16384
+#define DTO_DEFAULT_MIN_SIZE 65536
 #define DTO_INITIALIZED 0
 #define DTO_INITIALIZING 1
 
@@ -429,6 +429,13 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp)
 		__dsa_wait(comp);
 		local_num_waits++;
 	}
+
+	// operations that have failed (mostly due to page fault) return very quickly and cause the algorithm
+	// to think that the the DSA operation was faster than it really was. We exclude them from the calculation.
+	if(*comp != DSA_COMP_SUCCESS) {
+		return;
+	}
+
 	adjust_num_descs++;
 	adjust_num_waits += local_num_waits;
 
