@@ -432,7 +432,7 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp)
 
 	// operations that have failed (mostly due to page fault) return very quickly and cause the algorithm
 	// to think that the DSA operation was faster than it really was. We exclude them from the calculation.
-	if(*comp != DSA_COMP_SUCCESS) {
+	if (*comp != DSA_COMP_SUCCESS) {
 		return;
 	}
 
