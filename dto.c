@@ -1560,7 +1560,6 @@ static bool dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 		size_t current_cpu_size_fraction = cpu_size_fraction;  // the cpu_size_fraction might be changed by the auto tune algorithm 
 		if (is_overlapping) {
 			threshold = wq->max_transfer_size;
-			cpu_size = 0;
 		} else {
 			threshold = wq->max_transfer_size * 100 / (100 - current_cpu_size_fraction);
 		}
