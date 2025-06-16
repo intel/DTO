@@ -244,7 +244,7 @@ static atomic_int fail_counter[HIST_NO_BUCKETS][MAX_FAILURES];
 static int init_dto(void) __attribute__((constructor));
 static void cleanup_dto(void) __attribute__((destructor));
 
-static int umwait_support;
+static int waitpkg_support;
 
 static enum {
 	LOG_LEVEL_FATAL,
@@ -1121,13 +1121,13 @@ static int dsa_init(void)
 	const char *env_str;
 	char wq_list[256];
 
-	/* detect umwait support */
+	/* detect waitpkg support */
 	leaf = 7;
 	waitpkg = 0;
 	if (__get_cpuid(0, &leaf, unused, &waitpkg, unused + 1)) {
 		if (waitpkg & 0x20) {
-			LOG_TRACE("umwait supported\n");
-			umwait_support = 1;
+			LOG_TRACE("waitpkg supported\n");
+			waitpkg_support = 1;
 		}
 	}
 
@@ -1138,7 +1138,7 @@ static int dsa_init(void)
 			min_avg_waits = MIN_AVG_POLL_WAITS;
 			max_avg_waits = MAX_AVG_POLL_WAITS;
 		} else if (!strncmp(env_str, wait_names[WAIT_UMWAIT], strlen(wait_names[WAIT_UMWAIT]))) {
-			if (umwait_support) {
+			if (waitpkg_support) {
 				wait_method = WAIT_UMWAIT;
 				/* Use the same waits as busypoll for now */
 				min_avg_waits = MIN_AVG_POLL_WAITS;
@@ -1146,7 +1146,7 @@ static int dsa_init(void)
 			} else
 				LOG_ERROR("umwait not supported. Falling back to default wait method\n");
 		} else if (!strncmp(env_str, wait_names[WAIT_TPAUSE], strlen(wait_names[WAIT_TPAUSE]))) {
-		    if (umwait_support) {
+		    if (waitpkg_support) {
 			wait_method = WAIT_TPAUSE;
                     } else {
 			LOG_ERROR("tpause not supported. Falling back to busypoll\n");
