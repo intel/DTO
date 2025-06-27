@@ -69,6 +69,28 @@ Following environment variables control the behavior of DTO library:
 	DTO_LOG_LEVEL=0/1/2 controls the log level. higher value means more verbose logging (default 0).
 ```
 
+Although not the only usage models of DTO, the following are some common ones:
+   Latency reduction - the goal is to minimize the latency of offloaded operations. Use the following settings:
+      DTO_AUTO_ADJUST_KNOBS=1 (the CPU fraction setting is critical to this mode. The optimal value is dynamic so autotune algorithm needs to be enabled) 
+      DTO_WAIT_METHOD=busypoll 
+
+   Power Reduction - the goal is to reduce power by offloading memory operations to DSA allowing the cpu core to go into a lower power state. This mode may reduce or increase the latency of operations depending on the load on DSA devices.
+      DTO_AUTO_ADJUST_KNOBS=0 
+      DTO_CPU_SIZE_FRACTION=0.0  (offload the entire operations to DSA) 
+      DTO_WAIT_METHOD=umwait 
+
+   Cycle count Reduction - the goal is to reduce cpu cycles by offloading memory operations to DSA. This mode may reduce or increase the latency of operations depending on the load on DSA devices and on interaction with the OS scheduler and other threads. The idea is to offload operations to DSA and allow the OS to schedule other work while DSA perform the operation.
+      DTO_AUTO_ADJUST_KNOBS=0 
+      DTO_CPU_SIZE_FRACTION=0.0  (offload the entire operations to DSA) 
+      DTO_WAIT_METHOD=yield
+
+   Avoiding Cache polution - the goal is to avoid polluting the cache with data from the given process.
+      DTO_DSA_CC=0
+      DTO_AUTO_ADJUST_KNOBS=0 
+      DTO_CPU_SIZE_FRACTION=0.0  (offload the entire operations to DSA so none of the data is pulled into cache) 
+      DTO_WAIT_METHOD=yield or umwait (saves either cycles or power)
+
+
 ## Build
 
 Pre-requisite packages:
