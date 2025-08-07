@@ -114,10 +114,23 @@ make dto-test
 make dto-test-wodto
 
 ```
+## Initializing DSA devices
+
+You can initialize a DSA device using the following:
+```bash
+./accelConfig.sh <device-id> <enable (yes/no)> <wq-id>
+```
+If you get invalid traffic class error, reload the idxd driver with tc_override=1:
+```bash
+modprobe -r idxd
+modprobe idxd tc_override=1
+```
+You can set the permissions of the DSA via chmod /dev/dsa/wqX.Y to allow users to submit
+to the DSA device.
 
 ## Test
 ```bash
-1. Make changes to test.sh or dto-4-dsa.conf to change DSA configuration if desired. test.sh configures DSA(s) using the config parameters in dto-4-dsa.conf
+1. Follow the steps in the Initializing DSA Devices section. Or you can make changes to test.sh or dto-4-dsa.conf to change DSA configuration if desired. test.sh configures DSA(s) using the config parameters in dto-4-dsa.conf.
 2. Run the test.sh script to run the dto-test app (DTO linked using -ldto) or dto-test-wodto app (DTO linked using LD_PRELOAD).
 3. Using with other applications (two ways to use it)
     3a. Using "-ldto" linker option (requires recompiling the application)
@@ -125,7 +138,7 @@ make dto-test-wodto
 	ii. Setup DTO environment variables (examples below)
             export DTO_USESTDC_CALLS=0
             export DTO_COLLECT_STATS=1
-            export DTO_WAIT_METHOD=yield
+            export DTO_WAIT_METHOD=busypoll
             export DTO_MIN_BYTES=8192
             export DTO_CPU_SIZE_FRACTION=0.33
             export DTO_AUTO_ADJUST_KNOBS=1
