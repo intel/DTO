@@ -4,6 +4,7 @@ echo "OPTIONAL Arg-1: DSA device id. Default: 0"
 echo "OPTIONAL Arg-2: Enable/Disable DSA device. Default: yes"
 echo "OPTIONAL Arg-3: SHARED WQ id. Default: 1"
 echo "OPTIONAL Arg-4: ENGINE count. Default: 4"
+echo "OPTIONAL Arg-5: Block on fault. Default: no, but this is needed for CRC32!"
 
 if [ "$#" -ge 5 ]; then
     echo "ERROR: Incorrect argument count. Expected arg count <= 4"
@@ -14,6 +15,7 @@ DEVID=${1:-0}
 ENABLE=${2:-yes}
 SWQID=${3:-1}
 NENGS=${4:-4}
+BLOCKONFAULT=${5:-no}
 
 DEV=dsa${DEVID}
 SWQ=${DEV}/wq${DEVID}.${SWQID}
@@ -41,7 +43,11 @@ accel-config config-wq ${SWQ} --priority=1
 accel-config config-wq ${SWQ} --wq-size=128
 accel-config config-wq ${SWQ} --max-batch-size=1024
 accel-config config-wq ${SWQ} --max-transfer-size=2147483648
-accel-config config-wq ${SWQ} --block-on-fault=0
+if [ "${BLOCKONFAULT}" == "yes" ]; then
+    accel-config config-wq ${SWQ} --block-on-fault=1
+else
+    accel-config config-wq ${SWQ} --block-on-fault=0
+
 accel-config config-wq ${SWQ} --type=user
 accel-config config-wq ${SWQ} --name="dsa-test"
 accel-config config-wq ${SWQ} --mode=shared
