@@ -1,2 +1,7 @@
 dto-test*
 libdto.so*
+*.egg-info/
+__pycache__/
+build/
+dist/
+.pytest_cache/

@@ -1,4 +1,9 @@
 #!/bin/bash
+# ==========================================================================
+# Copyright (C) 2023 Intel Corporation
+#
+# SPDX-License-Identifier: MIT
+# ==========================================================================
 
 echo "OPTIONAL Arg-1: DSA device id. Default: 0"
 echo "OPTIONAL Arg-2: Enable/Disable DSA device. Default: yes"

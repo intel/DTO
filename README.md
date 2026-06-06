@@ -137,7 +137,7 @@ to the DSA device.
 3. Using with other applications (two ways to use it)
     3a. Using "-ldto" linker option (requires recompiling the application)
         i. Recompile the application with "-ldto" linker options
-	ii. Setup DTO environment variables (examples below)
+        ii. Setup DTO environment variables (examples below)
             export DTO_USESTDC_CALLS=0
             export DTO_COLLECT_STATS=1
             export DTO_WAIT_METHOD=busypoll
@@ -146,12 +146,12 @@ to the DSA device.
             export DTO_AUTO_ADJUST_KNOBS=1
             export DTO_WQ_LIST="wq0.0;wq2.0;wq4.0;wq6.0"
             export DTO_IS_NUMA_AWARE=1
-	iii. Run the application - (CacheBench example below)
-    3b. Using LD_PRELOAD method (doesn not require recompiling the application)
-	i. setup LD_PRELOAD environment variable to point to DTO library
+        iii. Run the application - (CacheBench example below)
+    3b. Using LD_PRELOAD method (does not require recompiling the application)
+        i. setup LD_PRELOAD environment variable to point to DTO library
             export  LD_PRELOAD=<libdto file path>:$LD_PRELOAD
-	ii. Export all environment variables (similar to ii. in option 3a. above)
-	iii. Run the application - (CacheBench example below)
+        ii. Export all environment variables (similar to ii. in option 3a. above)
+        iii. Run the application - (CacheBench example below)
 
 	<CBENCH_DIR>/cachebench -json_test_config <json file> --progress_stats_file=dto.log --report_api_latency
 
@@ -225,3 +225,96 @@ When linking DTO using LD_PRELOAD environment variable special care is required 
       - When the application is started by a script with #!<location of shell> which invokes another script with #!<location of shell>, for 
         unknown reasons DTO causes a segmentation fault during a memset operation on an 8K sized buffer. This can be avoided by setting the minimum 
         DTO size above 8K, or by avoiding this invocation sequence.
+
+## DTO Parameter Optimization (dtoopt)
+
+DTO includes a standalone Bayesian optimization tool under `dtoopt/` that tunes the following DTO environment variables:
+
+- `DTO_MIN_BYTES`
+- `DTO_CPU_SIZE_FRACTION`
+
+Before dtoopt begins optimization, it should set `DTO_AUTO_ADJUST_KNOBS=0` so DTO's internal auto-tuning is disabled during the search. In other words, dtoopt optimizes `DTO_MIN_BYTES` and `DTO_CPU_SIZE_FRACTION` with `DTO_AUTO_ADJUST_KNOBS` fixed to `0`.
+
+For standalone sweep/plot utilities, see `dtoopt/scripts/README.md`.
+
+The tool runs a user-provided workload command multiple times, sets trial DTO values as environment variables for each run, forces `DTO_AUTO_ADJUST_KNOBS=0`, extracts a metric from workload output, and returns the best parameter combination.
+
+### Prerequisites
+
+- Python 3
+- `scikit-optimize`
+- `pip`
+
+```bash
+python3 -m pip install --user ./dtoopt
+```
+
+This installs a standalone `dtoopt` command from this repository.
+If your shell cannot find it, add `~/.local/bin` to your `PATH`.
+
+### Run the optimizer
+
+You can run `dtoopt` from any directory, as long as the `dtoopt` executable is available in your `PATH`.
+The repository root is only required when you rely on repository-relative paths (for example, `python3 -m pip install --user ./dtoopt` or `--command "./dto-test-wodto"`).
+
+```bash
+dtoopt --command "<your workload command>" --trials 30 --results-dir "optimizer_results"
+```
+
+Alternative (without installing the command):
+
+```bash
+python3 -m dtoopt --command "<your workload command>" --trials 30 --results-dir "optimizer_results"
+```
+
+By default, `--metric-regex` captures DTO runtime from lines like:
+
+```text
+DTO Run Time: 22826 ms
+```
+
+using this default regex:
+
+```text
+DTO\s+Run\s+Time:\s*([0-9]+(?:\.[0-9]+)?)\s*ms
+```
+
+If your workload prints a different metric, override `--metric-regex`.
+
+### Representative validation with dto-test
+
+Build test app without DTO link (for `LD_PRELOAD` style experiments):
+
+```bash
+make dto-test-wodto
+```
+
+Example: optimize against the progress metric printed by `dto-test`:
+
+```bash
+dtoopt \
+   --command "./dto-test-wodto" \
+   --metric-regex "completed\\s+([0-9]+)\\s+ops" \
+   --mode maximize \
+   --trials 20 \
+   --results-dir "optimizer_results"
+```
+
+### Useful knobs
+
+- `--min-bytes-low`: Lower bound (inclusive) of the `DTO_MIN_BYTES` search range.
+- `--min-bytes-high`: Upper bound (inclusive) of the `DTO_MIN_BYTES` search range.
+- `--min-bytes-step`: Step size used to snap candidate `DTO_MIN_BYTES` values.
+- `--cpu-fraction-low`: Lower bound (inclusive) of the `DTO_CPU_SIZE_FRACTION` search range.
+- `--cpu-fraction-high`: Upper bound (inclusive) of the `DTO_CPU_SIZE_FRACTION` search range.
+- `--cpu-fraction-step`: Step size used to snap candidate `DTO_CPU_SIZE_FRACTION` values.
+- `--initial-points`: Number of initial random trials before Bayesian-guided trials begin.
+- `--seed`: Random seed for reproducible trial sequences.
+- `--timeout-sec`: Per-trial command timeout in seconds.
+
+### Output artifacts
+
+The optimizer writes artifacts under the directory provided by `--results-dir`:
+
+- `<results-dir>/trials.jsonl`: one record per trial
+- `<results-dir>/best.json`: best parameters and objective summary

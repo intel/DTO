@@ -24,6 +24,9 @@ atomic_int no_ops = 0;
 
 int thread_func(void *thr_data)
 {
+	int thread_id = (intptr_t)thr_data;
+	printf("[DEBUG] Thread ID: %d\n", thread_id);
+	
 	// allocate memory
 	void *src_addr = calloc(ALLOC_SIZE, sizeof(uint8_t));
 	void *dest_addr = calloc(ALLOC_SIZE, sizeof(uint8_t));
@@ -56,7 +59,7 @@ int main(int argc, char **argv)
  	thrd_t threads[MAX_THREADS];
 
 	for(int t = 0; t < MAX_THREADS; ++t)
-		thrd_create(&threads[t], thread_func, NULL);
+		thrd_create(&threads[t], thread_func, (void *)(intptr_t)t);
 
 	for(int t = 0; t < MAX_THREADS; ++t)
 		thrd_join(threads[t], NULL);

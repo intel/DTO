@@ -27,5 +27,9 @@ dto-test: dto-test.c
 dto-test-wodto: dto-test.c
 	gcc -g dto-test.c $(DML_LIB_CXX) -o dto-test-wodto -lpthread
 
+dtoopt-install:
+	python3 -m pip install --user .
+	@echo "dtoopt installed. If needed, add ~/.local/bin to PATH"
+
 clean:
-	rm -rf *.o *.so dto-test
+	rm -rf *.o *.so dto-test dto-test-wodto
