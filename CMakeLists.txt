@@ -100,6 +100,15 @@ if (HAS_WAITPKG)
   target_compile_options(dto PRIVATE -mwaitpkg -march=native)
 endif()
 
+# Build dtoctl with a default preload path matching the library installation.
+get_filename_component(DTOCTL_LIBDIR "${CMAKE_INSTALL_LIBDIR}" ABSOLUTE
+    BASE_DIR "${CMAKE_INSTALL_PREFIX}")
+set(DTOCTL_LIBPATH "${DTOCTL_LIBDIR}/libdto.so" CACHE FILEPATH
+    "Path to libdto.so that dtoctl prepends to LD_PRELOAD")
+add_executable(dtoctl dtoctl.c)
+target_compile_definitions(dtoctl PRIVATE LIBDTO_PATH="${DTOCTL_LIBPATH}")
+install(TARGETS dtoctl RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
 # Build dto-test and dto-test-wodto
 add_executable(dto-test dto-test.c)
 target_link_libraries(dto-test PRIVATE DTO::dto pthread)
