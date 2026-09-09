@@ -225,6 +225,10 @@ if(DTO_BUILD_TESTS)
     endif()
 endif()
 
+include(GNUInstallDirs)
+
+install(FILES dto.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
 # Install and export the library
 install(TARGETS dto
         EXPORT DTOTargets

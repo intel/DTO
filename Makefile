@@ -14,6 +14,7 @@ libdto_nostats: dto.c
 
 install:
 	cp libdto.so.1.0 /usr/lib64/
+	cp dto.h /usr/include/
 	ln -sf /usr/lib64/libdto.so.1.0 /usr/lib64/libdto.so.1
 	ln -sf /usr/lib64/libdto.so.1.0 /usr/lib64/libdto.so
 
