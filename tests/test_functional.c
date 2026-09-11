@@ -19,6 +19,8 @@
  ******************************************************************************/
 
 #include "dto_test_utils.h"
+#include "../dto.h"
+#include <nmmintrin.h>
 #include <stdint.h>
 #include <pthread.h>
 
@@ -479,6 +481,229 @@ static int test_multithread(void)
 
 /* ---- Test runner ---- */
 
+/* ---- Explicit asynchronous API (dto.h) ---- */
+
+/* Standard CRC32C (Castagnoli): init 0xFFFFFFFF, final inversion, the
+ * convention dto.h documents for dto_async_crc_val. */
+__attribute__((target("sse4.2")))
+static uint32_t ref_crc32c(const void *buf, size_t n)
+{
+	const uint8_t *p = buf;
+	uint32_t crc = 0xFFFFFFFFu;
+	for (size_t i = 0; i < n; i++)
+		crc = _mm_crc32_u8(crc, p[i]);
+	return ~crc;
+}
+
+/* Poll until poll_expr leaves PENDING and yield its result. A submitted op
+ * owns its (stack-allocated) state until it completes, so a stall past the
+ * 10s safety timeout aborts the process rather than returning into a test
+ * that would let the device write into a dead stack frame. */
+#define ASYNC_WAIT(poll_expr) ({ \
+	struct timespec _start, _now; \
+	int _rc; \
+	clock_gettime(CLOCK_MONOTONIC, &_start); \
+	while ((_rc = (poll_expr)) == DTO_ASYNC_PENDING) { \
+		clock_gettime(CLOCK_MONOTONIC, &_now); \
+		if (_now.tv_sec - _start.tv_sec > 10) { \
+			fprintf(stderr, "    FATAL: async op still pending after 10s at %s:%d\n", \
+				__FILE__, __LINE__); \
+			abort(); \
+		} \
+	} \
+	_rc; })
+
+/* Submit a memcpy with the given flags and verify the data afterwards,
+ * whichever of the three documented outcomes (DONE, FAILED + CPU redo,
+ * FALLBACK + CPU copy) occurs. */
+static int check_async_memcpy(unsigned int flags)
+{
+	const size_t n = 1 << 20;
+	uint8_t *src = malloc(n), *dst = malloc(n);
+	dto_async_op op;
+	int rc;
+
+	ASSERT_TRUE(src && dst);
+	fill_pattern(src, n);
+	clear_buf(dst, n);
+
+	rc = dto_submit_memcpy(&op, dst, src, n, flags);
+	if (rc == DTO_ASYNC_SUBMITTED) {
+		rc = ASYNC_WAIT(dto_async_poll(&op));
+		ASSERT_TRUE(rc == DTO_ASYNC_DONE || rc == DTO_ASYNC_FAILED);
+		if (rc != DTO_ASYNC_DONE)
+			memcpy(dst, src, n);	/* documented caller fallback */
+	} else {
+		ASSERT_EQ(rc, DTO_ASYNC_FALLBACK);
+		memcpy(dst, src, n);
+	}
+	ASSERT_TRUE(verify_equal(dst, src, n));
+	free(src);
+	free(dst);
+	return 0;
+}
+
+static int test_async_memcpy(void)
+{
+	return check_async_memcpy(DTO_SUBMIT_CC | DTO_SUBMIT_BOF);
+}
+
+static int test_async_memcpy_no_bof(void)
+{
+	/* Without DTO_SUBMIT_BOF a page fault aborts the operation and poll
+	 * reports DTO_ASYNC_FAILED; the caller redoes the copy on the CPU.
+	 * Either outcome is valid here, the data must be right afterwards. */
+	return check_async_memcpy(0);
+}
+
+static int test_async_memset(void)
+{
+	const size_t n = 1 << 20;
+	uint8_t *dst = malloc(n);
+	dto_async_op op;
+	int rc;
+
+	ASSERT_TRUE(dst != NULL);
+	clear_buf(dst, n);
+
+	rc = dto_submit_memset(&op, dst, 0x5A, n, DTO_SUBMIT_BOF);
+	if (rc == DTO_ASYNC_SUBMITTED) {
+		rc = ASYNC_WAIT(dto_async_poll(&op));
+		ASSERT_TRUE(rc == DTO_ASYNC_DONE || rc == DTO_ASYNC_FAILED);
+		if (rc != DTO_ASYNC_DONE)
+			memset(dst, 0x5A, n);
+	} else {
+		ASSERT_EQ(rc, DTO_ASYNC_FALLBACK);
+		memset(dst, 0x5A, n);
+	}
+	ASSERT_TRUE(verify_set(dst, 0x5A, n));
+	free(dst);
+	return 0;
+}
+
+/* BOF is rejected by the device on a WQ configured without block-on-fault
+ * (dto.h), so like the other tests the CRC tests accept DTO_ASYNC_FAILED;
+ * the CRC value is only checked when the device completed the op. */
+static int test_async_crc(void)
+{
+	const size_t n = 256 * 1024;
+	uint8_t *src = malloc(n);
+	dto_async_op op;
+	uint32_t expect;
+	int rc;
+
+	ASSERT_TRUE(src != NULL);
+	fill_pattern(src, n);
+	expect = ref_crc32c(src, n);
+
+	rc = dto_submit_crc(&op, src, n, DTO_SUBMIT_BOF);
+	if (rc == DTO_ASYNC_SUBMITTED) {
+		rc = ASYNC_WAIT(dto_async_poll(&op));
+		ASSERT_TRUE(rc == DTO_ASYNC_DONE || rc == DTO_ASYNC_FAILED);
+		if (rc == DTO_ASYNC_DONE)
+			ASSERT_EQ(dto_async_crc_val(&op), expect);
+	} else {
+		ASSERT_EQ(rc, DTO_ASYNC_FALLBACK);
+	}
+	free(src);
+	return 0;
+}
+
+static int test_async_memcpy_crc(void)
+{
+	const size_t n = 256 * 1024;
+	uint8_t *src = malloc(n), *dst = malloc(n);
+	dto_async_op op;
+	uint32_t expect;
+	int rc;
+
+	ASSERT_TRUE(src && dst);
+	fill_pattern(src, n);
+	clear_buf(dst, n);
+	expect = ref_crc32c(src, n);
+
+	rc = dto_submit_memcpy_crc(&op, dst, src, n, DTO_SUBMIT_CC | DTO_SUBMIT_BOF);
+	if (rc == DTO_ASYNC_SUBMITTED) {
+		rc = ASYNC_WAIT(dto_async_poll(&op));
+		ASSERT_TRUE(rc == DTO_ASYNC_DONE || rc == DTO_ASYNC_FAILED);
+		if (rc == DTO_ASYNC_DONE)
+			ASSERT_EQ(dto_async_crc_val(&op), expect);
+		else
+			memcpy(dst, src, n);
+	} else {
+		ASSERT_EQ(rc, DTO_ASYNC_FALLBACK);
+		memcpy(dst, src, n);
+	}
+	ASSERT_TRUE(verify_equal(dst, src, n));
+	free(src);
+	free(dst);
+	return 0;
+}
+
+static int test_async_bad_args(void)
+{
+	uint8_t a[64], b[64];
+	void *dstv[1] = { a }, *srcv[1] = { b };
+	size_t sizes[1] = { 64 };
+	dto_async_op op;
+	dto_batch_op *bop;
+
+	/* zero length never reaches the device */
+	ASSERT_EQ(dto_submit_memcpy(&op, a, b, 0, 0), DTO_ASYNC_FALLBACK);
+	ASSERT_EQ(dto_submit_crc(&op, b, 0, 0), DTO_ASYNC_FALLBACK);
+
+	/* a DSA batch needs at least two descriptors */
+	bop = dto_batch_op_new();
+	ASSERT_TRUE(bop != NULL);
+	ASSERT_EQ(dto_submit_batch_copy(bop, dstv, srcv, sizes, 1, 0),
+		  DTO_ASYNC_FALLBACK);
+	dto_batch_op_free(bop);
+	return 0;
+}
+
+static int test_async_batch_copy(void)
+{
+	enum { COUNT = 8 };
+	const size_t base = 16 * 1024;
+	uint8_t *src[COUNT], *dst[COUNT];
+	void *srcv[COUNT], *dstv[COUNT];
+	size_t sizes[COUNT];
+	dto_batch_op *bop;
+	int rc;
+
+	for (int i = 0; i < COUNT; i++) {
+		sizes[i] = base * (i + 1) + i * 64; /* varied, some unaligned */
+		src[i] = malloc(sizes[i]);
+		dst[i] = malloc(sizes[i]);
+		ASSERT_TRUE(src[i] && dst[i]);
+		fill_pattern(src[i], sizes[i]);
+		clear_buf(dst[i], sizes[i]);
+		srcv[i] = src[i];
+		dstv[i] = dst[i];
+	}
+
+	bop = dto_batch_op_new();
+	ASSERT_TRUE(bop != NULL);
+	rc = dto_submit_batch_copy(bop, dstv, srcv, sizes, COUNT, DTO_SUBMIT_BOF);
+	if (rc == DTO_ASYNC_SUBMITTED) {
+		rc = ASYNC_WAIT(dto_batch_poll(bop));
+		ASSERT_EQ(rc, DTO_ASYNC_DONE);
+		/* a completed batch stays DONE */
+		ASSERT_EQ(dto_batch_poll(bop), DTO_ASYNC_DONE);
+	} else {
+		ASSERT_EQ(rc, DTO_ASYNC_FALLBACK);
+		for (int i = 0; i < COUNT; i++)
+			memcpy(dst[i], src[i], sizes[i]);
+	}
+	for (int i = 0; i < COUNT; i++) {
+		ASSERT_TRUE(verify_equal(dst[i], src[i], sizes[i]));
+		free(src[i]);
+		free(dst[i]);
+	}
+	dto_batch_op_free(bop);
+	return 0;
+}
+
 int main(void)
 {
 	printf("DTO Functional Tests\n");
@@ -495,6 +720,13 @@ int main(void)
 		TEST_ENTRY(test_zero_length),
 		TEST_ENTRY(test_memcpy_unaligned),
 		TEST_ENTRY(test_multithread),
+		TEST_ENTRY(test_async_memcpy),
+		TEST_ENTRY(test_async_memset),
+		TEST_ENTRY(test_async_crc),
+		TEST_ENTRY(test_async_memcpy_crc),
+		TEST_ENTRY(test_async_memcpy_no_bof),
+		TEST_ENTRY(test_async_bad_args),
+		TEST_ENTRY(test_async_batch_copy),
 		{NULL, NULL}
 	};
 
