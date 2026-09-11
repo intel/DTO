@@ -37,48 +37,78 @@ static const size_t test_sizes[] = {
 /*
  * Helper functions for verification.
  *
- * These use byte-by-byte loops so the compiler cannot optimize them
- * into memset/memcmp calls (which would be intercepted by DTO, defeating
- * the purpose of independent verification).
+ * These use byte-by-byte loops so the compiler cannot optimize them into
+ * memset/memcpy/memmove/memcmp calls. DTO interposes all four, so a folded
+ * loop would check DTO against itself instead of verifying it independently.
+ *
+ * The volatile pointers are what enforce that. A volatile access is an
+ * observable side effect the compiler may not elide, reorder or rewrite, so
+ * neither GCC's -ftree-loop-distribute-patterns nor LLVM's loop-idiom
+ * recognition can fold these loops into a library call. It must not be done
+ * with __attribute__((optimize("no-tree-loop-distribute-patterns"))): that is
+ * GCC-only and clang ignores it silently, which let clang turn clear_buf()
+ * into a call to DTO's own memset().
  */
-static int __attribute__((optimize("no-tree-loop-distribute-patterns")))
-verify_set(const uint8_t *buf, uint8_t val, size_t n)
+static int verify_set(const uint8_t *buf, uint8_t val, size_t n)
 {
+	const volatile uint8_t *p = buf;
+
 	for (size_t i = 0; i < n; i++) {
-		if (buf[i] != val) {
+		uint8_t got = p[i];
+
+		if (got != val) {
 			fprintf(stderr, "    byte[%zu] = 0x%02x, expected 0x%02x\n",
-				i, buf[i], val);
+				i, got, val);
 			return 0;
 		}
 	}
 	return 1;
 }
 
-static int __attribute__((optimize("no-tree-loop-distribute-patterns")))
-verify_equal(const uint8_t *a, const uint8_t *b, size_t n)
+static int verify_equal(const uint8_t *a, const uint8_t *b, size_t n)
 {
+	const volatile uint8_t *pa = a;
+	const volatile uint8_t *pb = b;
+
 	for (size_t i = 0; i < n; i++) {
-		if (a[i] != b[i]) {
+		uint8_t x = pa[i];
+		uint8_t y = pb[i];
+
+		if (x != y) {
 			fprintf(stderr, "    byte[%zu]: got 0x%02x, expected 0x%02x\n",
-				i, a[i], b[i]);
+				i, x, y);
 			return 0;
 		}
 	}
 	return 1;
 }
 
-static void __attribute__((optimize("no-tree-loop-distribute-patterns")))
-fill_pattern(uint8_t *buf, size_t n)
+static void fill_pattern(uint8_t *buf, size_t n)
 {
+	volatile uint8_t *p = buf;
+
 	for (size_t i = 0; i < n; i++)
-		buf[i] = (uint8_t)(i & 0xFF);
+		p[i] = (uint8_t)(i & 0xFF);
 }
 
-static void __attribute__((optimize("no-tree-loop-distribute-patterns")))
-clear_buf(uint8_t *buf, size_t n)
+static void clear_buf(uint8_t *buf, size_t n)
 {
+	volatile uint8_t *p = buf;
+
 	for (size_t i = 0; i < n; i++)
-		buf[i] = 0;
+		p[i] = 0;
+}
+
+/* Forward byte copy used to build expected results. Same volatile
+ * requirement as above: this must never become a memcpy/memmove call.
+ */
+static void copy_forward(uint8_t *dst, const uint8_t *src, size_t n)
+{
+	volatile uint8_t *d = dst;
+	const volatile uint8_t *s = src;
+
+	for (size_t i = 0; i < n; i++)
+		d[i] = s[i];
 }
 
 /* ---- memset tests ---- */
@@ -240,8 +270,7 @@ static int test_memmove_overlap_backward(void)
 		fill_pattern(ref, n + offset);
 
 		/* Reference: forward copy (correct for backward overlap) */
-		for (size_t i = 0; i < n; i++)
-			ref[i] = ref[offset + i];
+		copy_forward(ref, ref + offset, n);
 
 		memmove(buf, buf + offset, n);
 
@@ -342,8 +371,7 @@ static int test_zero_length(void)
 	clear_buf(b, 16);
 
 	/* Save original a */
-	for (int i = 0; i < 16; i++)
-		save_a[i] = a[i];
+	copy_forward(save_a, a, 16);
 
 	/* memset with n=0 should not modify buffer */
 	memset(a, 0xFF, 0);
