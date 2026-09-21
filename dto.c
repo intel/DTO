@@ -35,6 +35,9 @@
 #define likely(x)       __builtin_expect((x), 1)
 #define unlikely(x)     __builtin_expect((x), 0)
 
+#define PAGE_ALIGN_DOWN(x)  ((unsigned long)(x) & ~(getpagesize() - 1))
+#define PAGE_ALIGN_UP(x)    (((unsigned long)(x) + getpagesize() - 1) & ~(getpagesize() - 1))
+
 // DSA capabilities
 #define GENCAP_CC_MEMORY  0x4
 
@@ -67,6 +70,8 @@
 static __thread struct dsa_hw_desc thr_desc;
 static __thread struct dsa_completion_record thr_comp __attribute__((aligned(32)));
 static __thread uint64_t thr_bytes_completed;
+
+static void dsa_prefault_buffer(void *buf, size_t len, int write);
 
 // original std memory functions
 static void * (*orig_memset)(void *s, int c, size_t n);
@@ -1634,6 +1639,9 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 {
 	uint64_t memset_pattern;
 	size_t cpu_size, dsa_size;
+
+        dsa_prefault_buffer(s, n, 1);
+
 	struct dto_wq *wq = get_wq(s);
 
 	for (int i = 0; i < 8; ++i)
@@ -1737,6 +1745,7 @@ static bool dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 	}
 
 	dsa_size = n - cpu_size;
+	dsa_prefault_buffer(dest, n, 1);
 	wq = get_wq(dest);
 
 	thr_desc.opcode = DSA_OPCODE_MEMMOVE;
@@ -2134,4 +2143,25 @@ int memcmp(const void *s1, const void *s2, size_t n)
 #endif
 	}
 	return ret;
+}
+
+static void dsa_prefault_buffer(void *buf, size_t len, int write)
+{
+	long page_size = sysconf(_SC_PAGESIZE);
+	unsigned long addr = (unsigned long)buf;
+	unsigned long start = PAGE_ALIGN_DOWN(addr);
+	size_t aligned_len = PAGE_ALIGN_UP(len + (addr - start));
+
+	int ret = madvise(start, aligned_len, write ? MADV_POPULATE_WRITE : MADV_POPULATE_READ);
+
+	if (ret < 0) {
+		// Fallback
+		volatile char *p = (volatile char *)buf;
+		for (size_t i = 0; i < len; i += page_size) {
+			if (write)
+				p[i] = p[i];  // read-modify-write
+			else
+				(void)p[i];   // read only
+		}
+	}
 }
