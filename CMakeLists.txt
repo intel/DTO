@@ -1,10 +1,20 @@
 cmake_minimum_required(VERSION 3.5...3.31)
 project(DTO VERSION 1.0 LANGUAGES C)
 
-# Default to RelWithDebInfo when no build type is specified.
+# DTO may be built on its own or as part of another project (add_subdirectory
+# or FetchContent). As a subproject only the library is built by default, and
+# the parent's settings are left alone.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    set(DTO_IS_TOP_LEVEL ON)
+else()
+    set(DTO_IS_TOP_LEVEL OFF)
+endif()
+
+# Default to RelWithDebInfo when no build type is specified. Only at the top
+# level: CMAKE_BUILD_TYPE is the parent's when DTO is a subproject.
 # (Skip for multi-config generators, which ignore CMAKE_BUILD_TYPE.)
 get_property(_is_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
-if(NOT _is_multi_config AND NOT CMAKE_BUILD_TYPE)
+if(DTO_IS_TOP_LEVEL AND NOT _is_multi_config AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING
         "Choose the type of build" FORCE)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
@@ -125,14 +135,18 @@ if (HAS_WAITPKG)
 endif()
 
 # Build dto-test and dto-test-wodto
-add_executable(dto-test dto-test.c)
-target_link_libraries(dto-test PRIVATE DTO::dto pthread)
+option(DTO_BUILD_TEST_APPS "Build the dto-test and dto-test-wodto applications"
+       ${DTO_IS_TOP_LEVEL})
+if(DTO_BUILD_TEST_APPS)
+    add_executable(dto-test dto-test.c)
+    target_link_libraries(dto-test PRIVATE DTO::dto pthread)
 
-add_executable(dto-test-wodto dto-test.c)
-target_link_libraries(dto-test-wodto PRIVATE pthread)
+    add_executable(dto-test-wodto dto-test.c)
+    target_link_libraries(dto-test-wodto PRIVATE pthread)
+endif()
 
 # ---- Test Suite ----
-option(DTO_BUILD_TESTS "Build the DTO test suite" ON)
+option(DTO_BUILD_TESTS "Build the DTO test suite" ${DTO_IS_TOP_LEVEL})
 
 if(DTO_BUILD_TESTS)
     enable_testing()
@@ -176,20 +190,20 @@ if(DTO_BUILD_TESTS)
         endif()
 
         # Build current dto.c as object file with renamed symbols (cur_memcpy, etc.)
-        set(PERF_BASELINE_DIR "${CMAKE_BINARY_DIR}/perf_baseline")
+        set(PERF_BASELINE_DIR "${CMAKE_CURRENT_BINARY_DIR}/perf_baseline")
 
         add_custom_command(
-            OUTPUT ${CMAKE_BINARY_DIR}/dto_current.o
+            OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/dto_current.o
             COMMAND ${CMAKE_C_COMPILER} -c ${PERF_OBJ_CFLAGS}
-                    ${CMAKE_SOURCE_DIR}/dto.c
-                    -o ${CMAKE_BINARY_DIR}/dto_current_raw.o
+                    ${CMAKE_CURRENT_SOURCE_DIR}/dto.c
+                    -o ${CMAKE_CURRENT_BINARY_DIR}/dto_current_raw.o
             COMMAND objcopy --redefine-sym memcpy=cur_memcpy
                             --redefine-sym memset=cur_memset
                             --redefine-sym memcmp=cur_memcmp
                             --redefine-sym memmove=cur_memmove
-                            ${CMAKE_BINARY_DIR}/dto_current_raw.o
-                            ${CMAKE_BINARY_DIR}/dto_current.o
-            DEPENDS ${CMAKE_SOURCE_DIR}/dto.c
+                            ${CMAKE_CURRENT_BINARY_DIR}/dto_current_raw.o
+                            ${CMAKE_CURRENT_BINARY_DIR}/dto_current.o
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/dto.c
             COMMENT "Building dto_current.o with renamed symbols"
         )
 
@@ -200,8 +214,8 @@ if(DTO_BUILD_TESTS)
         # object is still fresh, and a custom command would never re-run once
         # the object exists.
         add_custom_target(dto_baseline_build
-            COMMAND bash ${CMAKE_SOURCE_DIR}/tests/build_baseline.sh
-                    ${CMAKE_SOURCE_DIR} ${PERF_BASELINE_DIR} ${CMAKE_C_COMPILER}
+            COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/build_baseline.sh
+                    ${CMAKE_CURRENT_SOURCE_DIR} ${PERF_BASELINE_DIR} ${CMAKE_C_COMPILER}
                     ${PERF_OBJ_CFLAGS}
             BYPRODUCTS ${PERF_BASELINE_DIR}/dto_baseline.o
             COMMENT "Building dto_baseline.o from baseline branch"
@@ -209,7 +223,7 @@ if(DTO_BUILD_TESTS)
 
         add_executable(dto-test-perf
             tests/test_perf.c
-            ${CMAKE_BINARY_DIR}/dto_current.o
+            ${CMAKE_CURRENT_BINARY_DIR}/dto_current.o
             ${PERF_BASELINE_DIR}/dto_baseline.o
         )
         add_dependencies(dto-test-perf dto_baseline_build)
@@ -241,7 +255,7 @@ if(DTO_BUILD_TESTS)
             LABELS "perf"
             TIMEOUT 2400
             RUN_SERIAL TRUE
-            ENVIRONMENT "RESULTS_DIR=${CMAKE_BINARY_DIR}/perf_results;${PERF_COMMON_ENV}"
+            ENVIRONMENT "RESULTS_DIR=${CMAKE_CURRENT_BINARY_DIR}/perf_results;${PERF_COMMON_ENV}"
         )
 
         # short sanity variant: memcpy 4k/64k/1m + memset 64k,
@@ -252,7 +266,7 @@ if(DTO_BUILD_TESTS)
             LABELS "perf"
             TIMEOUT 120
             RUN_SERIAL TRUE
-            ENVIRONMENT "PERF_SHORT=1;RESULTS_DIR=${CMAKE_BINARY_DIR}/perf_results_sanity;${PERF_COMMON_ENV}"
+            ENVIRONMENT "PERF_SHORT=1;RESULTS_DIR=${CMAKE_CURRENT_BINARY_DIR}/perf_results_sanity;${PERF_COMMON_ENV}"
         )
     else()
         message(STATUS "perf test: disabled (requires DTO_ACCEL_CONFIG_SUPPORT and "

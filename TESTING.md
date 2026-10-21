@@ -20,7 +20,9 @@ cmake --build build
 cd build
 ```
 
-To disable tests: `-DDTO_BUILD_TESTS=OFF`
+To disable tests: `-DDTO_BUILD_TESTS=OFF`. When DTO is built as part of
+another CMake project (`add_subdirectory` or `FetchContent`) the tests are off
+unless `DTO_BUILD_TESTS` is set.
 
 ## Running Tests
 
