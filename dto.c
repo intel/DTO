@@ -1883,11 +1883,23 @@ static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
 
 /* The dto_internal_mem* APIs are used only when mem* APIs are
  * called before DTO is properly initialized. So these
- * implementations dont have to be performant
+ * implementations dont have to be performant.
+ *
+ * The pointers below MUST stay volatile. At -O2 and above, GCC's
+ * loop-idiom recognition (-ftree-loop-distribute-patterns) rewrites
+ * these byte loops into calls to memset()/memcpy()/memcmp(). Because
+ * DTO exports its own memset()/memcpy()/memmove()/memcmp(), those
+ * calls go through the PLT and bind back to DTO's own interposed
+ * versions. The only way to reach dto_internal_mem*() is with
+ * dto_initialized == 0, so the interposed function would call the
+ * internal helper again, recursing until the stack guard page is hit
+ * (SIGSEGV during early startup or in a forked child, where the
+ * atfork handler resets dto_initialized). volatile accesses cannot be
+ * folded into a library call, which blocks the transform.
  */
 static void *dto_internal_memset(void *s1, int c, size_t n)
 {
-	char *dest = s1;
+	volatile char *dest = s1;
 	size_t i;
 
 	for (i = 0; i < n; i++)
@@ -1898,8 +1910,8 @@ static void *dto_internal_memset(void *s1, int c, size_t n)
 
 static void *dto_internal_memcpymove(void *dest, const void *src, size_t n)
 {
-	char *d = dest;
-	const char *s = (const char *)src;
+	volatile char *d = dest;
+	const volatile char *s = (const volatile char *)src;
 	ssize_t i;
 
 	if (s >= d) {
@@ -1917,13 +1929,16 @@ static void *dto_internal_memcpymove(void *dest, const void *src, size_t n)
 
 static int dto_internal_memcmp(const void *s1, const void *s2, size_t n)
 {
-	const unsigned char *src1 = (const unsigned char *)s1;
-	const unsigned char *src2 = (const unsigned char *)s2;
+	const volatile unsigned char *src1 = (const volatile unsigned char *)s1;
+	const volatile unsigned char *src2 = (const volatile unsigned char *)s2;
 	size_t i;
 
 	for (i = 0; i < n; i++) {
-		if (src1[i] != src2[i])
-			return src1[i] - src2[i];
+		unsigned char c1 = src1[i];
+		unsigned char c2 = src2[i];
+
+		if (c1 != c2)
+			return c1 - c2;
 	}
 	return 0;
 }
