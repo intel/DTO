@@ -204,63 +204,66 @@ them. With `--repeat=N` each way runs N times, alternating, and the report uses
 the medians; `--perf` adds one more run each way under `perf record`.
 
 ```bash
-sudo dtoctl -w busypoll --stats-run=app-stats --repeat=3 --perf ./app
+sudo taskset -c 2 dtoctl -w busypoll --no-auto-adjust -c 0 --stats-run=app-stats --repeat=3 --perf ./app
 ```
 
 ```
 DTO stats run: app-stats
   command: ./app
-  settings: DTO_WAIT_METHOD=busypoll
+  settings: DTO_AUTO_ADJUST_KNOBS=0 DTO_CPU_SIZE_FRACTION=0 DTO_WAIT_METHOD=busypoll
   timed runs: 3 CPU-only, 3 with DSA (medians)
-  DTO in the DSA run: 1 WQs, wait busypoll, min_bytes 65536, cpu_size_fraction 0.5 (auto-adjusted)
+  DTO in the DSA run: 1 WQs, wait busypoll, min_bytes 65536, cpu_size_fraction 0.0
 
                                      CPU only       with DSA   speedup
-  wall time                         972.66 ms         1.55 s     0.63x
-  CPU time (user+sys)               968.31 ms         1.54 s     0.63x
-    in mem* calls                   304.86 ms      794.05 ms     0.38x
-    outside mem* calls              663.45 ms      747.81 ms     0.89x
-  wall time, min-max          972.24-973.64 ms    1.26-1.58 s
+  wall time                            1.66 s         1.38 s     1.20x
+  CPU time (user+sys)                  1.65 s         1.38 s     1.20x
+    in mem* calls                   782.69 ms      493.11 ms     1.59x
+    outside mem* calls              868.09 ms      885.71 ms     0.98x
+  wall time, min-max              1.66-1.67 s    1.38-1.40 s
 
   Amdahl's law
-    f, share of CPU time in mem* calls (CPU-only)     31.5%
-    s, mem* speedup with DSA (time per byte)          0.38x
-    predicted speedup, 1 / ((1 - f) + f / s)          0.66x
-    measured speedup, wall time                       0.63x
-    limit if mem* took no time, 1 / (1 - f)           1.46x
+    f, share of CPU time in mem* calls (CPU-only)     47.4%
+    s, mem* speedup with DSA (time per byte)          1.59x
+    predicted speedup, 1 / ((1 - f) + f / s)          1.21x
+    measured speedup, wall time                       1.20x
+    limit if mem* took no time, 1 / (1 - f)           1.90x
 
   per operation       calls       bytes   avg size   CPU only   with DSA  speedup  on DSA       f
-  memcpy             20.00k     4.9 GiB  256.0 KiB  115.50 ms  266.45 ms    0.43x  100.0%   11.9%
-  memset             20.00k     4.9 GiB  256.0 KiB   96.36 ms   83.32 ms    1.16x  100.0%   10.0%
-  memcmp             20.00k     4.9 GiB  256.0 KiB   93.00 ms  444.27 ms    0.21x  100.0%    9.6%
+  memcpy             20.00k     4.9 GiB  256.0 KiB  596.44 ms  180.24 ms    3.31x   99.4%   36.1%
+  memset             20.00k     4.9 GiB  256.0 KiB   92.17 ms  100.59 ms    0.92x  100.0%    5.6%
+  memcmp             20.00k     4.9 GiB  256.0 KiB   94.09 ms  212.28 ms    0.44x  100.0%    5.7%
     (on DSA: share of the bytes in calls sent to DSA, of which the CPU does cpu_size_fraction;
      f: share of the CPU-only run's CPU time)
-    calls DSA left to the CPU, per run: page fault 1, retry 0, other 0
+    calls DSA left to the CPU, per run: page fault 128, retry 0, other 0
 
   by size (most time)       calls   CPU only   with DSA  speedup  on DSA
-  256K-320K                60.00k    5.08 us   13.23 us    0.38x  100.0%
+  256K-320K                60.00k   13.04 us    8.22 us    1.59x   99.8%
     (average time per call; on DSA: share of calls sent to DSA)
 
   profile (perf, % of CPU time)        CPU only   with DSA
-    memcpy/memmove                        13.0%      12.2%
-    memset                                10.0%       1.6%
-    memcmp                                10.2%       0.0%
-    CRC                                   14.6%      11.7%
-    DTO library                            0.0%      34.4%
-    libc, unknown function                 0.0%       0.1%
-    other user code                       51.5%      39.6%
-    other kernel code                      0.7%       0.5%
+    memcpy/memmove                        35.0%       0.3%
+    memset                                 6.0%       0.0%
+    memcmp                                 5.3%       0.0%
+    CRC                                    9.8%      12.5%
+    DTO library                            0.3%      28.7%
+    other user code                       31.2%      43.8%
+    other kernel code                     12.4%      14.8%
 
-  note: mem* calls that went to DSA were slower than on the CPU at every size this program used
-  note: 15% of the CPU-only run is CRC code: DSA can compute CRC32C, but DTO doesn't intercept CRC functions, so offloading it needs an explicit call
+  note: 10% of the CPU-only run is CRC code: DSA can compute CRC32C, but DTO doesn't intercept CRC functions, so offloading it needs an explicit call
 ```
 
-Here a single thread copies, sets and compares 256 KiB buffers that stay in
-the CPU caches, computes a CRC32C in software, and does other work. The CPU-only
-run spent f = 31.5% of its CPU time in mem\* calls, and those calls ran
-s = 0.38x as fast with DSA, so Amdahl's law predicts 1 / ((1 - f) + f / s) =
-0.66x for the whole program; it measured 0.63x. The rest of the gap is the
-time outside mem\* calls, which grew with DSA. At best, mem\* calls taking no
-time at all, this program could run 1.46x faster.
+Here a single thread, on a core of the DSA's NUMA node, copies 256 KiB at a
+time out of a 1 GiB buffer, so the data is not in the CPU caches, compares the
+copy with the source, clears it, computes a CRC32C in software, and does other
+work. The CPU-only run spent f = 47.4% of its CPU time in mem\* calls, and
+those calls took s = 1.59x less time per byte with DSA, so Amdahl's law
+predicts 1 / ((1 - f) + f / s) = 1.21x for the whole program; it measured
+1.20x. At best, mem\* calls taking no time at all, it could run 1.90x faster.
+The copies were 3.31x faster with DSA, but the compares, which read the copy
+right after it is made, were slower: a copy on the CPU leaves the data in its
+caches and a copy by DSA does not. The auto-tuner is off in this run
+(`--no-auto-adjust -c 0`); with it on, it gave part of each copy to the CPU and
+the program ran only 1.02x faster.
 
 The report also shows each operation and the sizes with the most time, so you
 can see where DSA wins and set `DTO_MIN_BYTES` accordingly, and notes anything
