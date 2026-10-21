@@ -23,18 +23,34 @@ option(DTO_NUMA_SUPPORT "Enable NUMA awareness support (requires libnuma)" ON)
 option(DTO_STATIC_ACCEL_CONFIG "Statically link accel-config into libdto.so" OFF)
 option(DTO_STATIC_NUMA "Statically link numa into libdto.so (requires PIC-compiled libnuma.a)" OFF)
 
+# libdto_explicit is the same library without the memcpy/memset/memmove/
+# memcmp interposers, for programs that call the dto_* API (dto.h) directly
+# and must not have every large libc copy in the process sent to DSA.
+option(DTO_BUILD_EXPLICIT "Also build libdto_explicit, without libc interposition" ON)
+
 # Build the shared library
 add_library(dto SHARED dto.c)
 add_library(DTO::dto ALIAS dto)
-target_include_directories(dto
-    PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+set(DTO_LIBRARIES dto)
+if(DTO_BUILD_EXPLICIT)
+    add_library(dto_explicit SHARED dto.c)
+    add_library(DTO::dto_explicit ALIAS dto_explicit)
+    target_compile_definitions(dto_explicit PRIVATE DTO_NO_LIBC_INTERPOSE)
+    list(APPEND DTO_LIBRARIES dto_explicit)
+endif()
+
+foreach(lib ${DTO_LIBRARIES})
+    target_include_directories(${lib}
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+endforeach()
 
 # set gnu source everywhere
 add_compile_definitions(_GNU_SOURCE)
 
-# Add the -DDTO_STATS_SUPPORT preprocessor definition
+# Add the -DDTO_STATS_SUPPORT preprocessor definition. Stats cover the
+# interposed calls, so libdto_explicit has none to collect.
 target_compile_definitions(dto PRIVATE DTO_STATS_SUPPORT)
 
 # Link libraries
@@ -43,7 +59,9 @@ set(DTO_DYNAMIC_LIBS dl)
 
 # Handle accel-config support
 if(DTO_ACCEL_CONFIG_SUPPORT)
-    target_compile_definitions(dto PRIVATE DTO_ACCEL_CONFIG_SUPPORT)
+    foreach(lib ${DTO_LIBRARIES})
+        target_compile_definitions(${lib} PRIVATE DTO_ACCEL_CONFIG_SUPPORT)
+    endforeach()
     message(STATUS "accel-config support: enabled")
 
     if(DTO_STATIC_ACCEL_CONFIG)
@@ -62,7 +80,9 @@ endif()
 
 # Handle numa support
 if(DTO_NUMA_SUPPORT)
-    target_compile_definitions(dto PRIVATE DTO_NUMA_SUPPORT)
+    foreach(lib ${DTO_LIBRARIES})
+        target_compile_definitions(${lib} PRIVATE DTO_NUMA_SUPPORT)
+    endforeach()
     message(STATUS "NUMA support: enabled")
 
     if(DTO_STATIC_NUMA)
@@ -83,21 +103,25 @@ endif()
 # Link everything together. Use PRIVATE so accel-config/numa/dl are the shared
 # library's own dependencies (resolved via its DT_NEEDED) rather than INTERFACE
 # requirements that would be forced onto every downstream consumer of DTO::dto.
-if(DTO_STATIC_LIBS)
-    target_link_libraries(dto PRIVATE
-        -Wl,--whole-archive
-        ${DTO_STATIC_LIBS}
-        -Wl,--no-whole-archive
-        ${DTO_DYNAMIC_LIBS}
-    )
-else()
-    target_link_libraries(dto PRIVATE ${DTO_DYNAMIC_LIBS})
-endif()
+foreach(lib ${DTO_LIBRARIES})
+    if(DTO_STATIC_LIBS)
+        target_link_libraries(${lib} PRIVATE
+            -Wl,--whole-archive
+            ${DTO_STATIC_LIBS}
+            -Wl,--no-whole-archive
+            ${DTO_DYNAMIC_LIBS}
+        )
+    else()
+        target_link_libraries(${lib} PRIVATE ${DTO_DYNAMIC_LIBS})
+    endif()
+endforeach()
 
 include(CheckCCompilerFlag)
 check_c_compiler_flag("-mwaitpkg" HAS_WAITPKG)
 if (HAS_WAITPKG)
-  target_compile_options(dto PRIVATE -mwaitpkg -march=native)
+  foreach(lib ${DTO_LIBRARIES})
+    target_compile_options(${lib} PRIVATE -mwaitpkg -march=native)
+  endforeach()
 endif()
 
 # Build dto-test and dto-test-wodto
@@ -122,6 +146,18 @@ if(DTO_BUILD_TESTS)
         LABELS "functional"
         TIMEOUT 120
     )
+
+    # The same tests against libdto_explicit: the explicit API without the
+    # interposers (the libc mem* tests then exercise libc itself).
+    if(DTO_BUILD_EXPLICIT)
+        add_executable(dto-test-functional-explicit tests/test_functional.c)
+        target_link_libraries(dto-test-functional-explicit PRIVATE DTO::dto_explicit pthread)
+        add_test(NAME functional_explicit COMMAND dto-test-functional-explicit)
+        set_tests_properties(functional_explicit PROPERTIES
+            LABELS "functional"
+            TIMEOUT 120
+        )
+    endif()
 
     # ---- A/B performance regression test ----
     # The baseline object is compiled from unguarded upstream sources that
@@ -225,8 +261,10 @@ if(DTO_BUILD_TESTS)
     endif()
 endif()
 
-# Install and export the library
-install(TARGETS dto
+install(FILES dto.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+# Install and export the libraries
+install(TARGETS ${DTO_LIBRARIES}
         EXPORT DTOTargets
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
