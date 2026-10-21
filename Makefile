@@ -12,6 +12,8 @@ DML_LIB_CXX=-D_GNU_SOURCE
 DTOCTL_LIBPATH ?= /usr/lib64/libdto.so
 PANDOC ?= pandoc
 MANDIR ?= /usr/share/man
+# Version reported by "dtoctl --version", taken from the CMake project.
+DTO_VERSION := $(shell grep -o 'DTO VERSION [0-9.]*' CMakeLists.txt | cut -d' ' -f3)
 
 libdto: dto.c
 	gcc -shared -fPIC -Wl,-soname,libdto.so dto.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -DDTO_ACCEL_CONFIG_SUPPORT -DDTO_NUMA_SUPPORT -o libdto.so.1.0 -laccel-config -ldl -lnuma -mwaitpkg
@@ -20,7 +22,7 @@ libdto_nostats: dto.c
 	gcc -shared -fPIC -Wl,-soname,libdto.so dto.c $(DML_LIB_CXX) -DDTO_ACCEL_CONFIG_SUPPORT -DDTO_NUMA_SUPPORT -o libdto.so.1.0 -laccel-config -ldl -lnuma -mwaitpkg
 
 dtoctl: dtoctl.c
-	gcc -O2 -Wall dtoctl.c -DLIBDTO_PATH=\"$(DTOCTL_LIBPATH)\" -o dtoctl
+	gcc -O2 -Wall dtoctl.c -DLIBDTO_PATH=\"$(DTOCTL_LIBPATH)\" -DDTO_VERSION=\"$(DTO_VERSION)\" -o dtoctl
 
 man: doc/dtoctl.1
 
@@ -31,7 +33,7 @@ doc/dtoctl.1: doc/dtoctl.md
 		echo "Skipping dtoctl manual generation: install pandoc to build the man page."; \
 	fi
 
-install: install-man
+install: dtoctl install-man
 	cp libdto.so.1.0 /usr/lib64/
 	ln -sf /usr/lib64/libdto.so.1.0 /usr/lib64/libdto.so.1
 	ln -sf /usr/lib64/libdto.so.1.0 /usr/lib64/libdto.so

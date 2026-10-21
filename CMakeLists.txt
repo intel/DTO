@@ -100,13 +100,27 @@ if (HAS_WAITPKG)
   target_compile_options(dto PRIVATE -mwaitpkg -march=native)
 endif()
 
-# Build dtoctl with a default preload path matching the library installation.
-get_filename_component(DTOCTL_LIBDIR "${CMAKE_INSTALL_LIBDIR}" ABSOLUTE
-    BASE_DIR "${CMAKE_INSTALL_PREFIX}")
-set(DTOCTL_LIBPATH "${DTOCTL_LIBDIR}/libdto.so" CACHE FILEPATH
-    "Path to libdto.so that dtoctl prepends to LD_PRELOAD")
+# Build dtoctl.  By default it preloads the libdto.so installed alongside it,
+# found relative to the dtoctl binary so "cmake --install --prefix" still works,
+# and falls back to the configured install path.  Set DTOCTL_LIBPATH to always
+# preload a specific library instead.
+set(DTOCTL_LIBPATH "" CACHE FILEPATH
+    "Path to libdto.so that dtoctl preloads by default (empty: the installed libdto.so)")
 add_executable(dtoctl dtoctl.c)
-target_compile_definitions(dtoctl PRIVATE LIBDTO_PATH="${DTOCTL_LIBPATH}")
+target_compile_definitions(dtoctl PRIVATE DTO_VERSION="${PROJECT_VERSION}")
+if(DTOCTL_LIBPATH)
+    target_compile_definitions(dtoctl PRIVATE LIBDTO_PATH="${DTOCTL_LIBPATH}")
+else()
+    # Not cached, so it follows later changes to CMAKE_INSTALL_PREFIX.
+    get_filename_component(DTOCTL_LIBDIR "${CMAKE_INSTALL_LIBDIR}" ABSOLUTE
+        BASE_DIR "${CMAKE_INSTALL_PREFIX}")
+    get_filename_component(DTOCTL_BINDIR "${CMAKE_INSTALL_BINDIR}" ABSOLUTE
+        BASE_DIR "${CMAKE_INSTALL_PREFIX}")
+    file(RELATIVE_PATH DTOCTL_REL_LIBPATH "${DTOCTL_BINDIR}" "${DTOCTL_LIBDIR}/libdto.so")
+    target_compile_definitions(dtoctl PRIVATE
+        LIBDTO_PATH="${DTOCTL_LIBDIR}/libdto.so"
+        LIBDTO_REL_PATH="${DTOCTL_REL_LIBPATH}")
+endif()
 install(TARGETS dtoctl RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # Build and install the optional section 1 manual.
@@ -148,6 +162,15 @@ if(DTO_BUILD_TESTS)
     set_tests_properties(functional PROPERTIES
         LABELS "functional"
         TIMEOUT 120
+    )
+
+    # dtoctl option handling and environment setup (no DSA hardware needed)
+    add_test(NAME dtoctl
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_dtoctl.sh
+                $<TARGET_FILE:dtoctl> $<TARGET_FILE:dto>)
+    set_tests_properties(dtoctl PROPERTIES
+        LABELS "functional"
+        TIMEOUT 60
     )
 
     # ---- A/B performance regression test ----
