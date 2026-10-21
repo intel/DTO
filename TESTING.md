@@ -86,8 +86,10 @@ queues DTO uses share the same setting.
 Checks for the `dtoctl` wrapper: every option sets its `DTO_*` variable,
 invalid values are rejected, the library path is resolved and validated,
 `LD_PRELOAD` and inherited variables are handled, and exit statuses follow
-`env(1)`. The last check runs a program under `dtoctl` and reads libdto's own
-configuration trace. No DSA hardware is needed.
+`env(1)`. `--stats-run` is checked from its `--dry-run` plan and by running a
+small shell command: each run's environment and stats file, `runs.jsonl`, the
+report, and stopping at a failed run. The last check runs a program under
+`dtoctl` and reads libdto's own configuration trace. No DSA hardware is needed.
 
 ```bash
 ctest -R dtoctl
@@ -107,6 +109,12 @@ It needs Python 3 and no DSA hardware.
 ```bash
 ctest -R stats
 ```
+
+`stats-report` checks `dto-stats-report` on made-up runs with known answers
+(Amdahl's law, per-operation and per-size speedups, medians, the notes it
+makes), sorts made-up perf samples into categories, and checks that it finds
+memcpy, memset and memcmp by address in this machine's libc. It needs Python 3,
+and neither DSA nor perf.
 
 ## Performance Tests
 

@@ -43,6 +43,7 @@ install: dtoctl install-man
 	ln -sf /usr/lib64/libdto.so.1.0 /usr/lib64/libdto.so.1
 	ln -sf /usr/lib64/libdto.so.1.0 /usr/lib64/libdto.so
 	cp dtoctl /usr/bin/
+	cp dto-stats-report /usr/bin/
 
 install-man: man
 	@if [ -f doc/dtoctl.1 ]; then \
