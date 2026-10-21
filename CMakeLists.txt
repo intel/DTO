@@ -39,7 +39,10 @@ target_compile_definitions(dto PRIVATE DTO_STATS_SUPPORT)
 
 # Link libraries
 set(DTO_STATIC_LIBS "")
-set(DTO_DYNAMIC_LIBS dl)
+# pthread: stats use thread keys and a sampler thread; before glibc 2.34 these
+# are not in libc, so a program that doesn't link libpthread itself would fail
+# to load libdto.
+set(DTO_DYNAMIC_LIBS dl pthread)
 
 # Handle accel-config support
 if(DTO_ACCEL_CONFIG_SUPPORT)
@@ -122,6 +125,24 @@ if(DTO_BUILD_TESTS)
         LABELS "functional"
         TIMEOUT 120
     )
+
+    # Stats collection (DTO_COLLECT_STATS): a workload of known calls, checked
+    # by a Python script. Runs without DSA (everything is counted as CPU).
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    add_executable(dto-test-stats-workload tests/test_stats_workload.c)
+    target_compile_options(dto-test-stats-workload PRIVATE -fno-builtin)
+    target_link_libraries(dto-test-stats-workload PRIVATE DTO::dto pthread)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME stats
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_stats.py
+                    $<TARGET_FILE:dto-test-stats-workload> $<TARGET_FILE:dto>)
+        set_tests_properties(stats PROPERTIES
+            LABELS "functional"
+            TIMEOUT 120
+        )
+    else()
+        message(STATUS "stats test: disabled (python3 not found)")
+    endif()
 
     # ---- A/B performance regression test ----
     # The baseline object is compiled from unguarded upstream sources that
