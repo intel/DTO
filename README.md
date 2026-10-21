@@ -95,6 +95,39 @@ Although not the only usage models of DTO, the following are some common ones:
       DTO_WAIT_METHOD=yield or umwait (saves either cycles or power)
 
 
+## Using dtoctl
+
+Setting `LD_PRELOAD` and exporting the `DTO_*` environment variables by hand is
+error prone. The `dtoctl` tool provides a simpler interface: it takes the DTO
+settings as command line options, converts them to the corresponding `DTO_*`
+environment variables, prepends `libdto.so` to `LD_PRELOAD`, and then runs the
+target program. For example, instead of
+
+```bash
+export LD_PRELOAD=/usr/local/lib/libdto.so
+export DTO_WAIT_METHOD=busypoll
+export DTO_CPU_SIZE_FRACTION=0.33
+export DTO_AUTO_ADJUST_KNOBS=1
+./prog
+```
+
+you can run
+
+```bash
+dtoctl -w busypoll -c 0.33 ./prog
+```
+
+Every environment variable listed above has a corresponding option, and only the
+options you pass are applied: a `DTO_*` variable you already exported is left
+untouched, and an explicit option overrides it. The `libdto.so` path is resolved
+from `-l/--library`, then `$DTO_LIBRARY`, then the compiled-in default
+(`/usr/local/lib/libdto.so` for a CMake build, `/usr/lib64/libdto.so` for the
+Makefile build), and is prepended to any existing `LD_PRELOAD`.
+
+Run `dtoctl --help` for the option list, or `man 1 dtoctl` for the full manual,
+which documents each option and gives a ready-to-run command for each of the
+usage models above.
+
 ## Build
 
 Pre-requisite packages:
