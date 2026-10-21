@@ -59,6 +59,20 @@ hardware -- DTO falls back to CPU transparently.
 ctest -R functional
 ```
 
+## dtoctl Tests
+
+Checks for the `dtoctl` wrapper: every option sets its `DTO_*` variable,
+invalid values are rejected, the library path is resolved and validated,
+`LD_PRELOAD` and inherited variables are handled, and exit statuses follow
+`env(1)`. The last check runs a program under `dtoctl` and reads libdto's own
+configuration trace. No DSA hardware is needed.
+
+```bash
+ctest -R dtoctl
+# or directly, from the source directory
+tests/test_dtoctl.sh build/dtoctl build/libdto.so
+```
+
 ## Performance Tests
 
 The performance test (`perf`) detects regressions in libdto by
