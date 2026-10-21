@@ -39,7 +39,10 @@ target_compile_definitions(dto PRIVATE DTO_STATS_SUPPORT)
 
 # Link libraries
 set(DTO_STATIC_LIBS "")
-set(DTO_DYNAMIC_LIBS dl)
+# pthread: stats use thread keys and a sampler thread; before glibc 2.34 these
+# are not in libc, so a program that doesn't link libpthread itself would fail
+# to load libdto.
+set(DTO_DYNAMIC_LIBS dl pthread)
 
 # Handle accel-config support
 if(DTO_ACCEL_CONFIG_SUPPORT)
@@ -100,6 +103,52 @@ if (HAS_WAITPKG)
   target_compile_options(dto PRIVATE -mwaitpkg -march=native)
 endif()
 
+# Build dtoctl.  By default it preloads the libdto.so installed alongside it,
+# found relative to the dtoctl binary so "cmake --install --prefix" still works,
+# and falls back to the configured install path.  Set DTOCTL_LIBPATH to always
+# preload a specific library instead.
+set(DTOCTL_LIBPATH "" CACHE FILEPATH
+    "Path to libdto.so that dtoctl preloads by default (empty: the installed libdto.so)")
+add_executable(dtoctl dtoctl.c)
+target_compile_definitions(dtoctl PRIVATE DTO_VERSION="${PROJECT_VERSION}")
+if(DTOCTL_LIBPATH)
+    target_compile_definitions(dtoctl PRIVATE LIBDTO_PATH="${DTOCTL_LIBPATH}")
+else()
+    # Not cached, so it follows later changes to CMAKE_INSTALL_PREFIX.
+    get_filename_component(DTOCTL_LIBDIR "${CMAKE_INSTALL_LIBDIR}" ABSOLUTE
+        BASE_DIR "${CMAKE_INSTALL_PREFIX}")
+    get_filename_component(DTOCTL_BINDIR "${CMAKE_INSTALL_BINDIR}" ABSOLUTE
+        BASE_DIR "${CMAKE_INSTALL_PREFIX}")
+    file(RELATIVE_PATH DTOCTL_REL_LIBPATH "${DTOCTL_BINDIR}" "${DTOCTL_LIBDIR}/libdto.so")
+    target_compile_definitions(dtoctl PRIVATE
+        LIBDTO_PATH="${DTOCTL_LIBDIR}/libdto.so"
+        LIBDTO_REL_PATH="${DTOCTL_REL_LIBPATH}")
+endif()
+install(TARGETS dtoctl RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# dto-stats-report summarizes "dtoctl --stats-run"; dtoctl looks for it next to
+# itself first, so copy it beside dtoctl in the build tree too.
+configure_file(dto-stats-report ${CMAKE_CURRENT_BINARY_DIR}/dto-stats-report COPYONLY)
+install(PROGRAMS dto-stats-report DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# Build and install the optional section 1 manual.
+find_program(PANDOC_EXECUTABLE NAMES pandoc)
+if(PANDOC_EXECUTABLE)
+    set(DTOCTL_MAN_PAGE "${CMAKE_CURRENT_BINARY_DIR}/doc/dtoctl.1")
+    add_custom_command(
+        OUTPUT "${DTOCTL_MAN_PAGE}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/doc"
+        COMMAND "${PANDOC_EXECUTABLE}" --standalone --to=man
+                "${CMAKE_CURRENT_SOURCE_DIR}/doc/dtoctl.md" -o "${DTOCTL_MAN_PAGE}"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/doc/dtoctl.md"
+        COMMENT "Generating dtoctl(1) manual"
+        VERBATIM)
+    add_custom_target(dtoctl-man ALL DEPENDS "${DTOCTL_MAN_PAGE}")
+    install(FILES "${DTOCTL_MAN_PAGE}" DESTINATION ${CMAKE_INSTALL_MANDIR}/man1)
+else()
+    message(STATUS "Skipping dtoctl manual generation and installation: install pandoc to build the man page.")
+endif()
+
 # Build dto-test and dto-test-wodto
 add_executable(dto-test dto-test.c)
 target_link_libraries(dto-test PRIVATE DTO::dto pthread)
@@ -122,6 +171,43 @@ if(DTO_BUILD_TESTS)
         LABELS "functional"
         TIMEOUT 120
     )
+
+    # dtoctl option handling and environment setup (no DSA hardware needed)
+    add_test(NAME dtoctl
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_dtoctl.sh
+                $<TARGET_FILE:dtoctl> $<TARGET_FILE:dto>)
+    set_tests_properties(dtoctl PROPERTIES
+        LABELS "functional"
+        TIMEOUT 60
+    )
+
+    # Stats collection (DTO_COLLECT_STATS): a workload of known calls, checked
+    # by a Python script. Runs without DSA (everything is counted as CPU).
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    add_executable(dto-test-stats-workload tests/test_stats_workload.c)
+    target_compile_options(dto-test-stats-workload PRIVATE -fno-builtin)
+    target_link_libraries(dto-test-stats-workload PRIVATE DTO::dto pthread)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME stats
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_stats.py
+                    $<TARGET_FILE:dto-test-stats-workload> $<TARGET_FILE:dto>)
+        set_tests_properties(stats PROPERTIES
+            LABELS "functional"
+            TIMEOUT 120
+        )
+    else()
+        message(STATUS "stats test: disabled (python3 not found)")
+    endif()
+    # dto-stats-report's arithmetic, on made-up runs
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME stats-report
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_stats_report.py
+                    ${CMAKE_CURRENT_BINARY_DIR}/dto-stats-report)
+        set_tests_properties(stats-report PROPERTIES
+            LABELS "functional"
+            TIMEOUT 60
+        )
+    endif()
 
     # ---- A/B performance regression test ----
     # The baseline object is compiled from unguarded upstream sources that
