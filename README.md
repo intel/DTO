@@ -124,6 +124,8 @@ The accel-config and libnuma dependencies are optional and can be disabled at co
 | `DTO_NUMA_SUPPORT` | `ON` | Use libnuma for NUMA-aware work queue selection. When disabled, libdto does not link against libnuma and the `DTO_IS_NUMA_AWARE` environment variable has no effect (work queues are used in round-robin order). |
 | `DTO_STATIC_ACCEL_CONFIG` | `OFF` | Statically link libaccel-config into libdto.so instead of depending on the shared library at runtime. Requires `libaccel-config.a` to be installed. |
 | `DTO_STATIC_NUMA` | `OFF` | Statically link libnuma into libdto.so instead of depending on the shared library at runtime. Requires a `libnuma.a` compiled with `-fPIC`. |
+| `DTO_BUILD_TESTS` | `ON` (`OFF` as a subproject) | Build the test suite (see [TESTING.md](TESTING.md)). |
+| `DTO_BUILD_TEST_APPS` | `ON` (`OFF` as a subproject) | Build the `dto-test` and `dto-test-wodto` applications. |
 
 Example: build without either dependency:
 ```bash
@@ -137,6 +139,17 @@ you need to build without them.
 
 The CMake build also produces the test applications in the build directory:
 `dto-test` (for the -ldto method) and `dto-test-wodto` (for the LD_PRELOAD method).
+
+DTO can also be built as part of another CMake project, with `add_subdirectory`
+or `FetchContent`, and linked as `DTO::dto`. Only the library is built then,
+unless `DTO_BUILD_TESTS` or `DTO_BUILD_TEST_APPS` is set, and the parent
+project's build type is left as it is:
+```cmake
+include(FetchContent)
+FetchContent_Declare(dto GIT_REPOSITORY https://github.com/intel/DTO.git GIT_TAG main)
+FetchContent_MakeAvailable(dto)
+target_link_libraries(myapp PRIVATE DTO::dto)
+```
 
 CMake installs the library to `/usr/local/lib` by default, while the deprecated
 Makefile installs to `/usr/lib64`. Pass `-DCMAKE_INSTALL_PREFIX=<prefix>` at
