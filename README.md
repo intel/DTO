@@ -150,6 +150,85 @@ rather than `dtoctl sudo ...`, which loses `LD_PRELOAD` and the `DTO_*`
 variables, and pass settings as options: `sudo` does not pass on variables
 exported in your shell.
 
+### Measuring the speedup from DSA
+
+`dtoctl --stats-run` runs a program CPU-only (`DTO_USESTDC_CALLS=1`) and then
+with DSA, collecting DTO's JSON stats (see [Statistics](#statistics)) from each
+run into a directory, and `dto-stats-report` (installed with `dtoctl`) compares
+them. With `--repeat=N` each way runs N times, alternating, and the report uses
+the medians; `--perf` adds one more run each way under `perf record`.
+
+```bash
+sudo dtoctl -w busypoll --stats-run=app-stats --repeat=3 --perf ./app
+```
+
+```
+DTO stats run: app-stats
+  command: ./app
+  settings: DTO_WAIT_METHOD=busypoll
+  timed runs: 3 CPU-only, 3 with DSA (medians)
+  DTO in the DSA run: 1 WQs, wait busypoll, min_bytes 65536, cpu_size_fraction 0.5 (auto-adjusted)
+
+                                     CPU only       with DSA   speedup
+  wall time                         972.66 ms         1.55 s     0.63x
+  CPU time (user+sys)               968.31 ms         1.54 s     0.63x
+    in mem* calls                   304.86 ms      794.05 ms     0.38x
+    outside mem* calls              663.45 ms      747.81 ms     0.89x
+  wall time, min-max          972.24-973.64 ms    1.26-1.58 s
+
+  Amdahl's law
+    f, share of CPU time in mem* calls (CPU-only)     31.5%
+    s, mem* speedup with DSA (time per byte)          0.38x
+    predicted speedup, 1 / ((1 - f) + f / s)          0.66x
+    measured speedup, wall time                       0.63x
+    limit if mem* took no time, 1 / (1 - f)           1.46x
+
+  per operation       calls       bytes   avg size   CPU only   with DSA  speedup  on DSA       f
+  memcpy             20.00k     4.9 GiB  256.0 KiB  115.50 ms  266.45 ms    0.43x  100.0%   11.9%
+  memset             20.00k     4.9 GiB  256.0 KiB   96.36 ms   83.32 ms    1.16x  100.0%   10.0%
+  memcmp             20.00k     4.9 GiB  256.0 KiB   93.00 ms  444.27 ms    0.21x  100.0%    9.6%
+    (on DSA: share of the bytes in calls sent to DSA, of which the CPU does cpu_size_fraction;
+     f: share of the CPU-only run's CPU time)
+    calls DSA left to the CPU, per run: page fault 1, retry 0, other 0
+
+  by size (most time)       calls   CPU only   with DSA  speedup  on DSA
+  256K-320K                60.00k    5.08 us   13.23 us    0.38x  100.0%
+    (average time per call; on DSA: share of calls sent to DSA)
+
+  profile (perf, % of CPU time)        CPU only   with DSA
+    memcpy/memmove                        13.0%      12.2%
+    memset                                10.0%       1.6%
+    memcmp                                10.2%       0.0%
+    CRC                                   14.6%      11.7%
+    DTO library                            0.0%      34.4%
+    libc, unknown function                 0.0%       0.1%
+    other user code                       51.5%      39.6%
+    other kernel code                      0.7%       0.5%
+
+  note: mem* calls that went to DSA were slower than on the CPU at every size this program used
+  note: 15% of the CPU-only run is CRC code: DSA can compute CRC32C, but DTO doesn't intercept CRC functions, so offloading it needs an explicit call
+```
+
+Here a single thread copies, sets and compares 256 KiB buffers that stay in
+the CPU caches, computes a CRC32C in software, and does other work. The CPU-only
+run spent f = 31.5% of its CPU time in mem\* calls, and those calls ran
+s = 0.38x as fast with DSA, so Amdahl's law predicts 1 / ((1 - f) + f / s) =
+0.66x for the whole program; it measured 0.63x. The rest of the gap is the
+time outside mem\* calls, which grew with DSA. At best, mem\* calls taking no
+time at all, this program could run 1.46x faster.
+
+The report also shows each operation and the sizes with the most time, so you
+can see where DSA wins and set `DTO_MIN_BYTES` accordingly, and notes anything
+that makes the comparison doubtful. Among them: no call reaching DSA (no usable
+work queue: run with `sudo`), and runs that did different amounts of work, as
+a benchmark that runs for a fixed time does (speedups are then per byte). The
+perf profile splits each run's CPU time into copies, memset, memcmp, CRC,
+kernel copies, DTO itself (here, busy-polling for completions) and the rest. It
+also counts mem\* calls DTO cannot intercept, such as those made inside libc.
+Run `dto-stats-report app-stats` again at any time, or with `--json` for the
+numbers. Amdahl's estimate assumes the program keeps its CPUs busy; one that
+waits for I/O gains less in wall time.
+
 Run `dtoctl --help` for the option list, or `man 1 dtoctl` for the full manual,
 which documents each option and gives a ready-to-run command for each of the
 usage models above.
@@ -316,6 +395,10 @@ With `DTO_STATS_FORMAT=json` the output is JSON Lines, one record per line:
 operations and paths with no calls are left out. `t_ms` and `run_ms` count
 from DTO's start, and `config` holds the settings at exit, including the
 auto-tuned `min_bytes` and `cpu_size_fraction`.
+
+To compare a run with DSA against a CPU-only run, and see how close the speedup
+comes to what Amdahl's law predicts, use `dtoctl --stats-run` (see
+[Measuring the speedup from DSA](#measuring-the-speedup-from-dsa)).
 
 Every process that loads DTO with stats enabled writes its own records,
 tagged with its `pid`. They share `DTO_STATS_FILE` (records are appended
