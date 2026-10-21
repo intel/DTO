@@ -173,6 +173,24 @@ if(DTO_BUILD_TESTS)
         TIMEOUT 60
     )
 
+    # Stats collection (DTO_COLLECT_STATS): a workload of known calls, checked
+    # by a Python script. Runs without DSA (everything is counted as CPU).
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    add_executable(dto-test-stats-workload tests/test_stats_workload.c)
+    target_compile_options(dto-test-stats-workload PRIVATE -fno-builtin)
+    target_link_libraries(dto-test-stats-workload PRIVATE DTO::dto pthread)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME stats
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_stats.py
+                    $<TARGET_FILE:dto-test-stats-workload>)
+        set_tests_properties(stats PROPERTIES
+            LABELS "functional"
+            TIMEOUT 120
+        )
+    else()
+        message(STATUS "stats test: disabled (python3 not found)")
+    endif()
+
     # ---- A/B performance regression test ----
     # The baseline object is compiled from unguarded upstream sources that
     # always reference accel-config and numa, so the perf test can only be

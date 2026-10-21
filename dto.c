@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -176,9 +177,13 @@ static const char * const memop_names[] = {
 	[MEMCMP] = "cmp"
 };
 
-// memory stats
-#define HIST_BUCKET_SIZE 4096
-#define HIST_NO_BUCKETS 512
+// memory stats: a histogram by call size, with bucket 0 for calls under
+// 64 bytes, then four buckets per power of two up to 4 GiB, and a last
+// bucket for anything larger
+#define HIST_MIN_SHIFT 6
+#define HIST_MAX_SHIFT 32
+#define HIST_SUBS 4
+#define HIST_NO_BUCKETS (2 + (HIST_MAX_SHIFT - HIST_MIN_SHIFT) * HIST_SUBS)
 enum stat_group {
 	STDC_CALL = 0x0,
 	DSA_CALL_SUCCESS,
@@ -257,10 +262,57 @@ static struct timespec dto_start_time;
 		}								\
 	} while (0)								\
 
-static atomic_int op_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
-static atomic_ullong bytes_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP];
-static atomic_ullong lat_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
-static atomic_int fail_counter[HIST_NO_BUCKETS][MAX_FAILURES];
+/* the groups that have per-operation counters */
+#define STAT_GROUPS DSA_FAIL_CODES
+
+struct dto_op_stats {
+	uint64_t calls;
+	uint64_t bytes;
+	uint64_t ns;
+};
+
+struct dto_bucket_stats {
+	struct dto_op_stats op[STAT_GROUPS][MAX_MEMOP];
+	uint64_t fails[MAX_FAILURES];
+};
+
+struct dto_stats {
+	struct dto_op_stats total[STAT_GROUPS][MAX_MEMOP];
+	uint64_t fails[MAX_FAILURES];
+	struct dto_bucket_stats hist[HIST_NO_BUCKETS];
+};
+
+/* one per counting thread (see update_stats) */
+struct dto_thread_stats {
+	struct dto_thread_stats *prev, *next;
+	struct dto_stats s;
+};
+
+static struct dto_thread_stats *stats_threads;	/* live threads' blocks */
+static struct dto_stats stats_retired;		/* exited threads, summed */
+static pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_key_t stats_key;
+static bool stats_key_created;
+static __thread struct dto_thread_stats *thr_stats;
+static __thread bool thr_stats_off;	/* don't count this thread's calls */
+
+/* output: one formatter at a time (sampler, exit, SIGINT) */
+static pthread_mutex_t stats_out_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct dto_stats stats_scratch;
+enum { STATS_FORMAT_TEXT, STATS_FORMAT_JSON };
+static int stats_format;
+
+static bool stats_file_per_pid;	/* DTO_STATS_FILE has a %p */
+
+/* DTO_STATS_INTERVAL_MS */
+static unsigned long stats_interval_ms;
+static atomic_uchar sampler_started;
+static struct dto_stats sampler_prev;	/* totals at the previous record */
+static uint64_t sampler_prev_ns;
+
+static void print_stats(void);
+static void print_stats_from_signal(void);
+static void stats_fork_child(void);
 #endif
 
 /* call initialize/cleanup functions when library is loaded/unloaded */
@@ -281,29 +333,7 @@ static enum {
 
 static unsigned int log_level = LOG_LEVEL_FATAL;
 
-static void dto_stats_log(const char *fmt, ...)
-{
-        char buf[512];
-        va_list args;
-
-        if (stats_fd == -1 && LOG_LEVEL_TRACE > log_level)
-                return;
-
-        va_start(args, fmt);
-        if (stats_fd != -1) {
-                if (vsnprintf(buf, sizeof(buf), fmt, args) > 0)
-                        write(stats_fd, buf, strlen(buf));
-        } else if (log_fd == -1) {
-                vprintf(fmt, args);
-        } else {
-                vsnprintf(buf, sizeof(buf), fmt, args);
-                write(log_fd, buf, strlen(buf));
-        }
-        va_end(args);
-}
-
 #ifdef DTO_STATS_SUPPORT
-static void print_stats(void);
 static struct sigaction previous_sigint_action;
 static volatile sig_atomic_t sigint_handler_installed;
 static int previous_sigint_action_valid;
@@ -327,8 +357,7 @@ static void restore_sigint_handler(void)
 
 static void dto_handle_sigint(int signo)
 {
-        if (collect_stats)
-                print_stats();
+        print_stats_from_signal();
 
         restore_sigint_handler();
 
@@ -407,20 +436,7 @@ static void dto_log(int req_log_level, const char *fmt, ...)
 static void child (void)
 {
 #ifdef DTO_STATS_SUPPORT
-	int i, j, k;
-
-	/* Reset the counters */
-	for (i = 0; i < HIST_NO_BUCKETS; i++) {
-		for (j = 0; j < MAX_STAT_GROUP; j++) {
-			for (k = 0; k < MAX_MEMOP; k++) {
-				op_counter[i][j][k] = 0;
-				lat_counter[i][j][k] = 0;
-			}
-			bytes_counter[i][j] = 0;
-		}
-		for (j = 0; j < MAX_FAILURES; j++)
-			fail_counter[i][j] = 0;
-	}
+	stats_fork_child();
 #endif
 	dto_initializing = 0;
 	dto_initialized = 0;
@@ -661,114 +677,660 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
 }
 
 #ifdef DTO_STATS_SUPPORT
+/*
+ * Statistics (DTO_COLLECT_STATS).
+ *
+ * Each thread counts into its own block, so an update is a few plain loads
+ * and stores with no shared cache line; the blocks are summed when stats are
+ * printed. A block is mmap'd on the thread's first update (only the pages it
+ * touches are ever allocated), registered in a list, and on thread exit
+ * folded into stats_retired and unmapped. The totals sit at the start of the
+ * block, so the interval sampler reads one page per thread.
+ */
+
+/* Histogram bucket of a call of n bytes. */
+static __always_inline int stats_bucket(size_t n)
+{
+	int e;
+
+	if (n < (1UL << HIST_MIN_SHIFT))
+		return 0;
+	e = 63 - __builtin_clzl(n);
+	if (e >= HIST_MAX_SHIFT)
+		return HIST_NO_BUCKETS - 1;
+	return 1 + (e - HIST_MIN_SHIFT) * HIST_SUBS +
+		(int)((n >> (e - 2)) & (HIST_SUBS - 1));
+}
+
+/* Smallest size counted in bucket b. */
+static uint64_t stats_bucket_min(int b)
+{
+	int e;
+
+	if (b == 0)
+		return 0;
+	if (b == HIST_NO_BUCKETS - 1)
+		return 1ULL << HIST_MAX_SHIFT;
+	e = HIST_MIN_SHIFT + (b - 1) / HIST_SUBS;
+	return (uint64_t)(HIST_SUBS + (b - 1) % HIST_SUBS) << (e - 2);
+}
+
+/* Relaxed load-add-store: the owning thread is the only writer, and
+ * readers summing blocks only need each counter to be read whole. */
+#define STAT_ADD(field, v) \
+	__atomic_store_n(&(field), __atomic_load_n(&(field), __ATOMIC_RELAXED) + (v), \
+			 __ATOMIC_RELAXED)
+#define STAT_GET(field) __atomic_load_n(&(field), __ATOMIC_RELAXED)
+
+static __always_inline void stats_add_op(struct dto_op_stats *s, uint64_t bytes,
+					 uint64_t ns)
+{
+	STAT_ADD(s->calls, 1);
+	STAT_ADD(s->bytes, bytes);
+	STAT_ADD(s->ns, ns);
+}
+
+/* dst += src for the totals, or for everything with hist */
+static void stats_sum(struct dto_stats *dst, struct dto_stats *src, bool hist)
+{
+	for (int g = 0; g < STAT_GROUPS; g++)
+		for (int o = 0; o < MAX_MEMOP; o++) {
+			dst->total[g][o].calls += STAT_GET(src->total[g][o].calls);
+			dst->total[g][o].bytes += STAT_GET(src->total[g][o].bytes);
+			dst->total[g][o].ns += STAT_GET(src->total[g][o].ns);
+		}
+	for (int f = 0; f < MAX_FAILURES; f++)
+		dst->fails[f] += STAT_GET(src->fails[f]);
+	if (!hist)
+		return;
+	for (int b = 0; b < HIST_NO_BUCKETS; b++) {
+		struct dto_bucket_stats *d = &dst->hist[b], *s = &src->hist[b];
+
+		for (int g = 0; g < STAT_GROUPS; g++)
+			for (int o = 0; o < MAX_MEMOP; o++) {
+				d->op[g][o].calls += STAT_GET(s->op[g][o].calls);
+				d->op[g][o].bytes += STAT_GET(s->op[g][o].bytes);
+				d->op[g][o].ns += STAT_GET(s->op[g][o].ns);
+			}
+		for (int f = 0; f < MAX_FAILURES; f++)
+			d->fails[f] += STAT_GET(s->fails[f]);
+	}
+}
+
+/* Sum of every thread's stats, live and exited, into *out (zeroed first).
+ * The caller holds stats_lock. */
+static void stats_collect(struct dto_stats *out, bool hist)
+{
+	size_t len = hist ? sizeof(*out) : offsetof(struct dto_stats, hist);
+
+	orig_memset(out, 0, len);
+	stats_sum(out, &stats_retired, hist);
+	for (struct dto_thread_stats *t = stats_threads; t; t = t->next)
+		stats_sum(out, &t->s, hist);
+}
+
+static void stats_snapshot(struct dto_stats *out, bool hist)
+{
+	pthread_mutex_lock(&stats_lock);
+	stats_collect(out, hist);
+	pthread_mutex_unlock(&stats_lock);
+}
+
+static void stats_start_sampler(void);
+
+static void stats_thread_exit(void *arg)
+{
+	struct dto_thread_stats *ts = arg;
+
+	/* memcpy and friends may still run during the rest of thread exit */
+	thr_stats_off = true;
+	thr_stats = NULL;
+	pthread_mutex_lock(&stats_lock);
+	stats_sum(&stats_retired, &ts->s, true);
+	if (ts->prev)
+		ts->prev->next = ts->next;
+	else
+		stats_threads = ts->next;
+	if (ts->next)
+		ts->next->prev = ts->prev;
+	pthread_mutex_unlock(&stats_lock);
+	munmap(ts, sizeof(*ts));
+}
+
+/* First update on this thread: give it a block. NULL leaves the thread
+ * uncounted (thr_stats_off stays set, so it is not retried every call). */
+static struct dto_thread_stats *stats_thread_register(void)
+{
+	struct dto_thread_stats *ts;
+
+	/* mmap, the registry and pthread_setspecific must not count themselves */
+	thr_stats_off = true;
+	ts = mmap(NULL, sizeof(*ts), PROT_READ | PROT_WRITE,
+		  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (ts == MAP_FAILED)
+		return NULL;
+
+	pthread_mutex_lock(&stats_lock);
+	ts->prev = NULL;
+	ts->next = stats_threads;
+	if (stats_threads)
+		stats_threads->prev = ts;
+	stats_threads = ts;
+	pthread_mutex_unlock(&stats_lock);
+	pthread_setspecific(stats_key, ts);
+	thr_stats = ts;
+
+	if (stats_interval_ms && !atomic_load_explicit(&sampler_started,
+						       memory_order_acquire))
+		stats_start_sampler();
+	thr_stats_off = false;
+	return ts;
+}
+
 static void update_stats(int op, size_t n, bool overlapping, size_t bytes_completed,
 		uint64_t elapsed_ns, int group, int error_code)
 {
+	struct dto_thread_stats *ts;
+	struct dto_bucket_stats *b;
+
 	// dto_memcpymove didn't actually submit the request to DSA, so there is nothing to log. This will be captured by a second call
 	if (op == MEMMOVE && overlapping && dto_overlapping_memmove_action == OVERLAPPING_CPU && group == DSA_CALL_SUCCESS) {
 		return;
 	}
+	if (unlikely(thr_stats_off))
+		return;
+	ts = thr_stats;
+	if (unlikely(ts == NULL)) {
+		ts = stats_thread_register();
+		if (ts == NULL)
+			return;
+	}
 
-	int bucket = (n / HIST_BUCKET_SIZE);
+	b = &ts->s.hist[stats_bucket(n)];
+	stats_add_op(&ts->s.total[group][op], bytes_completed, elapsed_ns);
+	stats_add_op(&b->op[group][op], bytes_completed, elapsed_ns);
+	if (group == DSA_CALL_FAILED) {
+		STAT_ADD(ts->s.fails[error_code], 1);
+		STAT_ADD(b->fails[error_code], 1);
+	}
+}
 
-	if (bucket >= HIST_NO_BUCKETS)  /* last bucket includes remaining sizes */
-		bucket = HIST_NO_BUCKETS-1;
-	++op_counter[bucket][group][op];
-	bytes_counter[bucket][group] += bytes_completed;
-	lat_counter[bucket][group][op] += elapsed_ns;
-	if (group == DSA_CALL_FAILED)
-		++fail_counter[bucket][error_code];
+/* ---- Output ----
+ *
+ * Records are formatted into stats_out and written with as few write()s as
+ * possible: to DTO_STATS_FILE (opened O_APPEND, so records from several
+ * processes sharing it stay whole), else DTO_LOG_FILE, else stdout. */
 
+static char stats_out[1 << 16];
+static size_t stats_out_len;
+
+static void stats_flush(void)
+{
+	int fd = stats_fd != -1 ? stats_fd : log_fd != -1 ? log_fd : STDOUT_FILENO;
+	size_t off = 0;
+
+	while (off < stats_out_len) {
+		ssize_t r = write(fd, stats_out + off, stats_out_len - off);
+
+		if (r <= 0)
+			break;
+		off += r;
+	}
+	stats_out_len = 0;
+}
+
+__attribute__((format(printf, 1, 2)))
+static void stats_printf(const char *fmt, ...)
+{
+	va_list args;
+	int len;
+
+	va_start(args, fmt);
+	len = vsnprintf(stats_out + stats_out_len, sizeof(stats_out) - stats_out_len,
+			fmt, args);
+	va_end(args);
+	if (len < 0)
+		return;
+	if ((size_t)len >= sizeof(stats_out) - stats_out_len) {
+		/* no room: write out what is there and format again */
+		stats_flush();
+		va_start(args, fmt);
+		len = vsnprintf(stats_out, sizeof(stats_out), fmt, args);
+		va_end(args);
+		if (len < 0)
+			return;
+		if ((size_t)len >= sizeof(stats_out))
+			len = sizeof(stats_out) - 1;
+	}
+	stats_out_len += len;
+}
+
+/* DTO_STATS_FILE, with each %p replaced by the process ID. It is opened
+ * O_APPEND, not truncated: processes started from this one (fork, exec)
+ * inherit the setting, and with %p each gets a file of its own, without it
+ * they append whole records to a shared one. */
+static void stats_open_file(const char *name)
+{
+	char path[PATH_MAX];
+	size_t j = 0;
+	struct stat st;
+
+	for (const char *c = name; *c && j < sizeof(path) - 1; c++) {
+		if (c[0] == '%' && c[1] == 'p') {
+			stats_file_per_pid = true;
+			int n = snprintf(path + j, sizeof(path) - j, "%d", getpid());
+
+			if (n < 0 || (size_t)n >= sizeof(path) - j)
+				break;
+			j += n;
+			c++;
+		} else {
+			path[j++] = *c;
+		}
+	}
+	path[j] = '\0';
+
+	if (lstat(path, &st) == 0 && (st.st_mode & S_IFMT) != S_IFREG) {
+		LOG_ERROR("DTO_STATS_FILE '%s' must reference a regular file\n", path);
+		return;
+	}
+	stats_fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+	if (stats_fd == -1)
+		LOG_ERROR("Failed to open DTO_STATS_FILE '%s': %s\n", path, strerror(errno));
+}
+
+static const char * const memop_json[] = {
+	[MEMSET] = "memset",
+	[MEMCOPY] = "memcpy",
+	[MEMMOVE] = "memmove",
+	[MEMCMP] = "memcmp",
+};
+
+static const char * const group_json[] = {
+	[STDC_CALL] = "cpu",
+	[DSA_CALL_SUCCESS] = "dsa",
+	[DSA_CALL_FAILED] = "dsa_failed",
+};
+
+static const char * const failure_json[] = {
+	[RETRY] = "retry",
+	[PAGE_FAULT] = "page_fault",
+	[FAIL_OTHERS] = "other",
+};
+
+static uint64_t stats_now_ns(void)
+{
+	struct timespec now;
+
+	clock_gettime(CLOCK_BOOTTIME, &now);
+	return TS_NS(dto_start_time, now);
+}
+
+/* {"memcpy":{"dsa":{"calls":..,"bytes":..,"ns":..},..},..} without zeroes */
+static void stats_json_ops(struct dto_op_stats op[STAT_GROUPS][MAX_MEMOP])
+{
+	bool first_op = true;
+
+	stats_printf("{");
+	for (int o = 0; o < MAX_MEMOP; o++) {
+		bool first_group = true;
+
+		for (int g = 0; g < STAT_GROUPS; g++) {
+			if (!op[g][o].calls)
+				continue;
+			if (first_group)
+				stats_printf("%s\"%s\":{", first_op ? "" : ",", memop_json[o]);
+			stats_printf("%s\"%s\":{\"calls\":%lu,\"bytes\":%lu,\"ns\":%lu}",
+				     first_group ? "" : ",", group_json[g], op[g][o].calls,
+				     op[g][o].bytes, op[g][o].ns);
+			first_group = false;
+			first_op = false;
+		}
+		if (!first_group)
+			stats_printf("}");
+	}
+	stats_printf("}");
+}
+
+static void stats_json_fails(uint64_t fails[MAX_FAILURES])
+{
+	stats_printf("{");
+	for (int f = 1; f < MAX_FAILURES; f++)
+		stats_printf("%s\"%s\":%lu", f == 1 ? "" : ",", failure_json[f], fails[f]);
+	stats_printf("}");
+}
+
+/* Text: "memcpy dsa 120 calls 7864320 B 421.3 us, cpu ..." */
+static void stats_text_ops(struct dto_op_stats op[STAT_GROUPS][MAX_MEMOP])
+{
+	bool any = false;
+
+	for (int o = 0; o < MAX_MEMOP; o++)
+		for (int g = 0; g < STAT_GROUPS; g++) {
+			if (!op[g][o].calls)
+				continue;
+			stats_printf("%s%s %s %lu calls %lu B %.1f us", any ? ", " : "",
+				     memop_json[o], group_json[g], op[g][o].calls,
+				     op[g][o].bytes, op[g][o].ns / 1000.0);
+			any = true;
+		}
+	if (!any)
+		stats_printf("no calls");
+}
+
+/* One interval record: the change in the totals since the previous one.
+ * The caller holds stats_out_lock. */
+static void stats_emit_interval(void)
+{
+	struct dto_stats *now = &stats_scratch;	/* totals part only */
+	struct dto_op_stats delta[STAT_GROUPS][MAX_MEMOP];
+	uint64_t fails[MAX_FAILURES];
+	uint64_t t = stats_now_ns();
+
+	stats_snapshot(now, false);
+	for (int g = 0; g < STAT_GROUPS; g++)
+		for (int o = 0; o < MAX_MEMOP; o++) {
+			delta[g][o].calls = now->total[g][o].calls - sampler_prev.total[g][o].calls;
+			delta[g][o].bytes = now->total[g][o].bytes - sampler_prev.total[g][o].bytes;
+			delta[g][o].ns = now->total[g][o].ns - sampler_prev.total[g][o].ns;
+		}
+	for (int f = 0; f < MAX_FAILURES; f++)
+		fails[f] = now->fails[f] - sampler_prev.fails[f];
+	orig_memcpy(&sampler_prev, now, offsetof(struct dto_stats, hist));
+
+	if (stats_format == STATS_FORMAT_JSON) {
+		stats_printf("{\"type\":\"interval\",\"pid\":%d,\"t_ms\":%.3f,\"dt_ms\":%.3f,\"ops\":",
+			     getpid(), t / 1e6, (t - sampler_prev_ns) / 1e6);
+		stats_json_ops(delta);
+		stats_printf(",\"failures\":");
+		stats_json_fails(fails);
+		stats_printf("}\n");
+	} else {
+		stats_printf("DTO stats t=%.3f ms (+%.3f ms): ", t / 1e6, (t - sampler_prev_ns) / 1e6);
+		stats_text_ops(delta);
+		if (fails[RETRY] || fails[PAGE_FAULT] || fails[FAIL_OTHERS])
+			stats_printf("; failures retry %lu page_fault %lu other %lu",
+				     fails[RETRY], fails[PAGE_FAULT], fails[FAIL_OTHERS]);
+		stats_printf("\n");
+	}
+	sampler_prev_ns = t;
+	stats_flush();
+}
+
+static bool stats_bucket_empty(struct dto_bucket_stats *b)
+{
+	for (int g = 0; g < STAT_GROUPS; g++)
+		for (int o = 0; o < MAX_MEMOP; o++)
+			if (b->op[g][o].calls)
+				return false;
+	return true;
+}
+
+static void stats_print_json(struct dto_stats *s, uint64_t run_ns)
+{
+	char prog[64];
+	bool first = true;
+	size_t j = 0;
+
+	/* the program name as a JSON string: drop quotes, backslashes and
+	 * control characters rather than escape them */
+	for (const char *c = __progname; *c && j < sizeof(prog) - 1; c++)
+		if (*c != '"' && *c != '\\' && (unsigned char)*c >= 0x20)
+			prog[j++] = *c;
+	prog[j] = '\0';
+	stats_printf("{\"type\":\"summary\",\"pid\":%d,\"program\":\"%s\",\"run_ms\":%.3f,",
+		     getpid(), prog, run_ns / 1e6);
+	stats_printf("\"config\":{\"stdc_only\":%d,\"wait_method\":\"%s\",\"min_bytes\":%lu,"
+		     "\"cpu_size_fraction\":%.2f,\"auto_adjust\":%d,\"numa_aware\":%d,\"wqs\":%d},",
+		     use_std_lib_calls, wait_names[wait_method], dsa_min_size,
+		     cpu_size_fraction / 100.0, auto_adjust_knobs, (int)is_numa_aware, num_wqs);
+	stats_printf("\"totals\":");
+	stats_json_ops(s->total);
+	stats_printf(",\"failures\":");
+	stats_json_fails(s->fails);
+	stats_printf(",\"histogram\":[");
+	for (int b = 0; b < HIST_NO_BUCKETS; b++) {
+		if (stats_bucket_empty(&s->hist[b]))
+			continue;
+		stats_printf("%s{\"min\":%lu,", first ? "" : ",", stats_bucket_min(b));
+		if (b < HIST_NO_BUCKETS - 1)
+			stats_printf("\"max\":%lu,", stats_bucket_min(b + 1) - 1);
+		stats_printf("\"ops\":");
+		stats_json_ops(s->hist[b].op);
+		stats_printf(",\"failures\":");
+		stats_json_fails(s->hist[b].fails);
+		stats_printf("}");
+		first = false;
+	}
+	stats_printf("]}\n");
+}
+
+static void stats_print_text(struct dto_stats *s, uint64_t run_ns)
+{
+	stats_printf("DTO Run Time: %lu ms\n", run_ns / 1000000);
+
+	for (int t = 0; t < 2; ++t) {
+		if (t == 0)
+			stats_printf("\n******** Number of Memory Operations ********\n");
+		else
+			stats_printf("\n******** Average Memory Operation Latency (us)  ********\n");
+
+		stats_printf("%23s    ", "");
+		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
+			if (t == 0) {
+				if (g == DSA_FAIL_CODES)
+					stats_printf("<***** %-13s *****> ", stat_group_names[g]);
+				else
+					stats_printf("<*************** %-13s ***************> ", stat_group_names[g]);
+			} else if (g != DSA_FAIL_CODES) {
+				stats_printf("<******** %-13s ********> ", stat_group_names[g]);
+			}
+		}
+		stats_printf("\n%-23s -- ", "Byte Range");
+		for (int g = 0; g < STAT_GROUPS; ++g) {
+			for (int o = 0; o < MAX_MEMOP; ++o)
+				stats_printf("%-8s ", memop_names[o]);
+			if (t == 0)
+				stats_printf("%-12s ", "bytes");
+		}
+		if (t == 0)
+			for (int o = 1; o < MAX_FAILURES; ++o)
+				stats_printf("%-6s ", failure_names[o]);
+		stats_printf("\n");
+
+		for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
+			struct dto_bucket_stats *h = &s->hist[b];
+
+			if (stats_bucket_empty(h))
+				continue;
+			if (b < HIST_NO_BUCKETS - 1)
+				stats_printf("%11lu-%-11lu -- ", stats_bucket_min(b),
+					     stats_bucket_min(b + 1) - 1);
+			else
+				stats_printf("   >=%-18lu -- ", stats_bucket_min(b));
+
+			for (int g = 0; g < STAT_GROUPS; ++g) {
+				uint64_t bytes = 0;
+
+				for (int o = 0; o < MAX_MEMOP; ++o) {
+					struct dto_op_stats *op = &h->op[g][o];
+
+					bytes += op->bytes;
+					if (t == 0)
+						stats_printf("%-8lu ", op->calls);
+					else if (op->calls)
+						stats_printf("%-8.2f ", op->ns / (op->calls * 1000.0));
+					else
+						stats_printf("%-8d ", 0);
+				}
+				if (t == 0)
+					stats_printf("%-12lu ", bytes);
+			}
+			if (t == 0)
+				for (int o = 1; o < MAX_FAILURES; ++o)
+					stats_printf("%-6lu ", h->fails[o]);
+			stats_printf("\n");
+		}
+	}
+}
+
+/* The end-of-run summary of *s. The caller holds stats_out_lock. */
+static void stats_print_summary(struct dto_stats *s)
+{
+	if (stats_format == STATS_FORMAT_JSON)
+		stats_print_json(s, stats_now_ns());
+	else
+		stats_print_text(s, stats_now_ns());
+	stats_flush();
 }
 
 static void print_stats(void)
 {
-	struct timespec dto_end_time;
+	bool off = thr_stats_off;
 
 	if (likely(!collect_stats))
 		return;
+	thr_stats_off = true;
+	pthread_mutex_lock(&stats_out_lock);
+	stats_snapshot(&stats_scratch, true);
+	stats_print_summary(&stats_scratch);
+	pthread_mutex_unlock(&stats_out_lock);
+	thr_stats_off = off;
+}
 
-	clock_gettime(CLOCK_BOOTTIME, &dto_end_time);
+/* From the SIGINT handler: the interrupted thread may hold a stats lock, so
+ * print only if both can be taken right away. */
+static void print_stats_from_signal(void)
+{
+	bool off = thr_stats_off;
 
-	dto_stats_log("DTO Run Time: %ld ms\n", TS_NS(dto_start_time, dto_end_time)/1000000);
-
-	// display stats
-	for (int t = 0; t < 2; ++t) {
-		if (t == 0)
-			dto_stats_log("\n******** Number of Memory Operations ********\n");
-		else
-			dto_stats_log("\n******** Average Memory Operation Latency (us)  ********\n");
-
-		dto_stats_log("%17s    ", "");
-		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
-			if (t == 0) {
-				if (g == DSA_FAIL_CODES)
-					dto_stats_log("<***** %-13s *****> ", stat_group_names[g]);
-				else
-					dto_stats_log("<*************** %-13s ***************> ", stat_group_names[g]);
-			} else {
-				if (g != DSA_FAIL_CODES)
-					dto_stats_log("<******** %-13s ********> ", stat_group_names[g]);
-
-			}
+	if (!collect_stats)
+		return;
+	thr_stats_off = true;
+	if (pthread_mutex_trylock(&stats_out_lock) == 0) {
+		if (pthread_mutex_trylock(&stats_lock) == 0) {
+			stats_collect(&stats_scratch, true);
+			pthread_mutex_unlock(&stats_lock);
+			stats_print_summary(&stats_scratch);
 		}
-		dto_stats_log("\n");
+		pthread_mutex_unlock(&stats_out_lock);
+	}
+	thr_stats_off = off;
+}
 
-		dto_stats_log("%-17s -- ", "Byte Range");
-		for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
-			for (int o = 0; o < MAX_MEMOP; ++o)
-				dto_stats_log("%-8s ", memop_names[o]);
-			if (t == 0)
-				dto_stats_log("%-12s ", "bytes");
-		}
-		if (t == 0)
-			for (int o = 1; o < MAX_FAILURES; ++o)
-				dto_stats_log("%-6s ", failure_names[o]);
-		dto_stats_log("\n");
+/* ---- Interval sampler (DTO_STATS_INTERVAL_MS) ---- */
 
-		for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
-			bool empty = true;
+static pthread_t sampler_thread;
+static pthread_mutex_t sampler_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t sampler_cv;
+static bool sampler_stop;
 
-			for (int g = 0; g < MAX_STAT_GROUP; ++g) {
-				for (int o = 0; o < MAX_MEMOP; ++o) {
-					if (op_counter[b][g][o] != 0) {
-						empty = false;
-						break;
-					}
-				}
-				if (!empty)
-					break;
-			}
-			if (empty)
-				continue;
+static void *stats_sampler(void *arg)
+{
+	struct timespec next;
 
-			if (b < (HIST_NO_BUCKETS-1))
-				dto_stats_log("% 8d-%-8d -- ", b*4096, ((b+1)*4096)-1);
-			else
-				dto_stats_log("   >=%-12d -- ", b*4096);
+	thr_stats_off = true;	/* its own formatting is not the program's */
+	clock_gettime(CLOCK_MONOTONIC, &next);
+	pthread_mutex_lock(&sampler_lock);
+	while (!sampler_stop) {
+		next.tv_nsec += (long)(stats_interval_ms % 1000) * 1000000;
+		next.tv_sec += stats_interval_ms / 1000 + next.tv_nsec / 1000000000;
+		next.tv_nsec %= 1000000000;
+		while (!sampler_stop &&
+		       pthread_cond_timedwait(&sampler_cv, &sampler_lock, &next) != ETIMEDOUT)
+			;
+		if (sampler_stop)
+			break;
+		pthread_mutex_unlock(&sampler_lock);
+		pthread_mutex_lock(&stats_out_lock);
+		stats_emit_interval();
+		pthread_mutex_unlock(&stats_out_lock);
+		pthread_mutex_lock(&sampler_lock);
+	}
+	pthread_mutex_unlock(&sampler_lock);
+	return NULL;
+}
 
-			for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
-				for (int o = 0; o < MAX_MEMOP; ++o) {
-					if (t == 0) {
-						dto_stats_log("%-8d ", op_counter[b][g][o]);
-						continue;
-					}
-					if (op_counter[b][g][o] != 0) {
-						double avg_us = ((double) lat_counter[b][g][o])/(((double) op_counter[b][g][o]) * 1000.0);
+/* Started by the first counted call (not from the constructor or the fork
+ * handler, where creating a thread is not safe), at most once per process. */
+static void stats_start_sampler(void)
+{
+	unsigned char expected = 0;
+	pthread_condattr_t attr;
+	sigset_t all, old;
 
-						dto_stats_log("%-8.2f ", avg_us);
-					} else {
-						dto_stats_log("%-8d ", 0);
-					}
-				}
-				if (t == 0)
-					dto_stats_log("%-12lld ", bytes_counter[b][g]);
-			}
-			if (t == 0)
-				for (int o = 1; o < MAX_FAILURES; ++o)
-					dto_stats_log("%-6d ", fail_counter[b][o]);
-			dto_stats_log("\n");
-		}
+	if (!atomic_compare_exchange_strong(&sampler_started, &expected, 1))
+		return;
+	pthread_condattr_init(&attr);
+	pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+	pthread_cond_init(&sampler_cv, &attr);
+	pthread_condattr_destroy(&attr);
+	sampler_stop = false;
+	/* the sampler must not take the program's signals */
+	sigfillset(&all);
+	pthread_sigmask(SIG_SETMASK, &all, &old);
+	if (pthread_create(&sampler_thread, NULL, stats_sampler, NULL))
+		atomic_store(&sampler_started, 0);
+	pthread_sigmask(SIG_SETMASK, &old, NULL);
+}
+
+static void stats_stop_sampler(void)
+{
+	if (!atomic_load(&sampler_started))
+		return;
+	pthread_mutex_lock(&sampler_lock);
+	sampler_stop = true;
+	pthread_cond_signal(&sampler_cv);
+	pthread_mutex_unlock(&sampler_lock);
+	pthread_join(sampler_thread, NULL);
+	atomic_store(&sampler_started, 0);
+	/* the part of the last interval since the sampler's final record */
+	pthread_mutex_lock(&stats_out_lock);
+	stats_emit_interval();
+	pthread_mutex_unlock(&stats_out_lock);
+}
+
+/* ---- fork ----
+ *
+ * The forking thread holds both stats locks across fork() so the child never
+ * inherits one held by a thread that does not exist there. */
+static void stats_fork_prepare(void)
+{
+	pthread_mutex_lock(&stats_out_lock);
+	pthread_mutex_lock(&stats_lock);
+}
+
+static void stats_fork_parent(void)
+{
+	pthread_mutex_unlock(&stats_lock);
+	pthread_mutex_unlock(&stats_out_lock);
+}
+
+/* In the child: drop every block (their threads are gone, and the child
+ * counts from zero) and forget the parent's sampler. */
+static void stats_fork_child(void)
+{
+	struct dto_thread_stats *t = stats_threads, *next;
+
+	pthread_mutex_unlock(&stats_lock);
+	pthread_mutex_unlock(&stats_out_lock);
+	for (; t; t = next) {
+		next = t->next;
+		munmap(t, sizeof(*t));
+	}
+	stats_threads = NULL;
+	orig_memset(&stats_retired, 0, sizeof(stats_retired));
+	orig_memset(&sampler_prev, 0, sizeof(sampler_prev));
+	sampler_prev_ns = 0;
+	pthread_setspecific(stats_key, NULL);
+	thr_stats = NULL;
+	thr_stats_off = false;
+	atomic_store(&sampler_started, 0);
+	stats_out_len = 0;
+	/* with %p the child writes a file of its own: init_dto opens it */
+	if (stats_file_per_pid && stats_fd != -1) {
+		close(stats_fd);
+		stats_fd = -1;
 	}
 }
 #endif
@@ -1436,28 +1998,43 @@ static int init_dto(void)
 		}
 
 		if (collect_stats) {
+			env_str = getenv("DTO_STATS_FORMAT");
+			if (env_str != NULL && !strcmp(env_str, "json"))
+				stats_format = STATS_FORMAT_JSON;
+			else if (env_str != NULL && strcmp(env_str, "text"))
+				LOG_ERROR("Unknown DTO_STATS_FORMAT '%s', using text\n", env_str);
+
+			env_str = getenv("DTO_STATS_INTERVAL_MS");
+			if (env_str != NULL) {
+				errno = 0;
+				stats_interval_ms = strtoul(env_str, NULL, 10);
+				if (errno)
+					stats_interval_ms = 0;
+			}
+
+			/* A forked child keeps the parent's (O_APPEND) file,
+			 * unless the name has a %p (see stats_fork_child). */
 			env_str = getenv("DTO_STATS_FILE");
-                        if (env_str != NULL) {
-                                struct stat st;
+			if (env_str != NULL && stats_fd == -1)
+				stats_open_file(env_str);
 
-                                if (lstat(env_str, &st) == -1 ||
-                                        (st.st_mode & S_IFMT) == S_IFREG) {
-                                        stats_fd = open(env_str, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-                                        if (stats_fd == -1)
-                                                LOG_ERROR("Failed to open DTO_STATS_FILE '%s': %s\n", env_str, strerror(errno));
-                                } else {
-                                        LOG_ERROR("DTO_STATS_FILE '%s' must reference a regular file\n", env_str);
-                                }
-                        }
+			if (!stats_key_created &&
+			    pthread_key_create(&stats_key, stats_thread_exit) == 0)
+				stats_key_created = true;
+			if (!stats_key_created) {
+				LOG_ERROR("Stats collection disabled: no thread key\n");
+				collect_stats = 0;
+			}
+		}
 
-                        clock_gettime(CLOCK_BOOTTIME, &dto_start_time);
-                        /* Change the log level to 'trace' so that the
-                         * stats can be logged
-                         */
-                        log_level = LOG_LEVEL_TRACE;
-                        dto_stats_log("Stats collection enabled, some latencies may be higher due to collection overhead.\n");
-                        install_sigint_handler();
-                }
+		if (collect_stats) {
+			clock_gettime(CLOCK_BOOTTIME, &dto_start_time);
+			if (stats_format == STATS_FORMAT_TEXT) {
+				stats_printf("Stats collection enabled, some latencies may be higher due to collection overhead.\n");
+				stats_flush();
+			}
+			install_sigint_handler();
+		}
 #endif
 
 		/* Register fork handler for the child process */
@@ -1467,7 +2044,11 @@ static int init_dto(void)
 			 * take that risk and disable DSA offload for parent
 			 * as well.
 			 */
+#ifdef DTO_STATS_SUPPORT
+			if (!pthread_atfork(stats_fork_prepare, stats_fork_parent, child))
+#else
 			if (!pthread_atfork(NULL, NULL, child))
+#endif
 				fork_handler_registered = 1;
 			else {
 				LOG_ERROR("Setting fork() handler failed. "
@@ -1592,7 +2173,10 @@ static void cleanup_dto(void)
 		close(wqs[i].wq_fd);
 	}
 #ifdef DTO_STATS_SUPPORT
-        print_stats();
+	if (collect_stats) {
+		stats_stop_sampler();
+		print_stats();
+	}
         restore_sigint_handler();
 #endif
         if (log_fd != -1)
