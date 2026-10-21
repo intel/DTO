@@ -12,6 +12,10 @@ libdto: dto.c
 libdto_nostats: dto.c
 	gcc -shared -fPIC -Wl,-soname,libdto.so dto.c $(DML_LIB_CXX) -DDTO_ACCEL_CONFIG_SUPPORT -DDTO_NUMA_SUPPORT -o libdto.so.1.0 -laccel-config -ldl -lnuma -mwaitpkg
 
+# the explicit dto_* API without the libc memcpy/memset/memmove/memcmp interposers
+libdto_explicit: dto.c
+	gcc -shared -fPIC -Wl,-soname,libdto_explicit.so dto.c $(DML_LIB_CXX) -DDTO_NO_LIBC_INTERPOSE -DDTO_ACCEL_CONFIG_SUPPORT -DDTO_NUMA_SUPPORT -o libdto_explicit.so.1.0 -laccel-config -ldl -lnuma -mwaitpkg
+
 install:
 	cp libdto.so.1.0 /usr/lib64/
 	cp dto.h /usr/include/
