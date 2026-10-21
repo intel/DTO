@@ -4,7 +4,7 @@
 # Checks DTO_COLLECT_STATS output against test_stats_workload's known calls.
 # Needs no DSA hardware: without it every call is counted on the CPU path.
 #
-# Usage: test_stats.py <test_stats_workload>
+# Usage: test_stats.py <test_stats_workload> <libdto.so>
 
 import json
 import os
@@ -13,6 +13,7 @@ import sys
 import tempfile
 
 WORKLOAD = sys.argv[1]
+LIBDTO = os.path.abspath(sys.argv[2])
 SIZES = {"memcpy": 131072 + 123, "memset": 65536 + 4096,
          "memmove": 98304 + 7, "memcmp": 262144 + 64}
 SIZE_CHILD = 524288 + 1
@@ -126,6 +127,12 @@ env = dict(os.environ, DTO_COLLECT_STATS="1", DTO_STATS_FILE=pattern,
 subprocess.run([WORKLOAD, "fork", "5"], env=env, check=True, capture_output=True)
 files = [f for f in os.listdir(tmp) if f.startswith("pp.")]
 check("%p gives each process its own file", len(files) == 2, str(files))
+
+# --- a program that doesn't link libpthread (before glibc 2.34, it isn't libc) ---
+env = dict(os.environ, LD_PRELOAD=LIBDTO, DTO_COLLECT_STATS="1",
+           DTO_STATS_INTERVAL_MS="1", DTO_STATS_FILE=os.path.join(tmp, "true.txt"))
+p = subprocess.run(["true"], env=env, capture_output=True, text=True)
+check("stats work in a program without libpthread", p.returncode == 0, p.stderr.strip())
 
 # --- text format ---
 _, text = run(["basic", "1", "10"], {"DTO_STATS_FORMAT": "text"},
