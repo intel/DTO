@@ -53,8 +53,8 @@ Following environment variables control the behavior of DTO library:
                                 Should be enabled for debugging/profiling only, not for perf evaluation (enabling it slows down the workload). Default is 0.
         DTO_STATS_FILE=<path> when DTO_COLLECT_STATS=1, redirect histogram output to the provided regular file instead of standard output.
                                 The file is truncated when DTO loads; failures fall back to standard output and emit an error.
-	DTO_WAIT_METHOD=<yield,busypoll,umwait> (specifies the method to use while waiting for DSA to complete operation, default is yield)
-	DTO_MIN_BYTES=xxxx (specifies minimum size of API call needed for DSA operation execution, default is 16384 bytes)
+	DTO_WAIT_METHOD=<yield,busypoll,umwait,tpause> (specifies the method to use while waiting for DSA to complete operation, default is busypoll)
+	DTO_MIN_BYTES=xxxx (specifies minimum size of API call needed for DSA operation execution, default is 65536 bytes)
 	DTO_CPU_SIZE_FRACTION=0.xx (specifies fraction of job performed by CPU, in parallel to DSA). Default is 0.00
 	DTO_AUTO_ADJUST_KNOBS=0/1 (disables/enables auto tuning of cpu_size_fraction and dsa_min_bytes parameters. 0 -- disable, 1 -- enable (default))
    DTO_IS_NUMA_AWARE=0/1/2 (disables/buffer-centric/cpu-centric numa awareness. 0 -- disable (default), 1 -- buffer-centric, 2 - cpu-centric)
@@ -69,7 +69,7 @@ Following environment variables control the behavior of DTO library:
    DTO_DSA_CC=0/1, 1 (default) - DTO sets DSA Cache Control flag to 1 if DSA supports cache control, 0 - DTO sets DSA Cache Control flag to 0
    DTO_OVERLAPPING_MEMMOVE_ACTION=0/1 0 (default) DTO submits memmove operations with overlapping buffers entirely to CPU, 1 - entirely to DSA
    DTO_UMWAIT_DELAY=xxxx defines delay for umwait command (check max possible value at: /sys/devices/system/cpu/umwait_control/max_time), default is 100000
-	DTO_LOG_FILE=<dto log file path> Redirect the DTO output to the specified file instead of std output (useful for debugging and statistics collection). file name is suffixed by process pid.
+	DTO_LOG_FILE=<dto log file path> Redirect the DTO output to the specified file instead of std output (useful for debugging and statistics collection). file name is suffixed by the program name and process pid (<path>.<program>.<pid>).
 	DTO_LOG_LEVEL=0/1/2 controls the log level. higher value means more verbose logging (default 0).
 ```
 
@@ -117,12 +117,35 @@ you can run
 dtoctl -w busypoll -c 0.33 ./prog
 ```
 
-Every environment variable listed above has a corresponding option, and only the
-options you pass are applied: a `DTO_*` variable you already exported is left
-untouched, and an explicit option overrides it. The `libdto.so` path is resolved
-from `-l/--library`, then `$DTO_LIBRARY`, then the compiled-in default
+Every environment variable listed above has a corresponding option, and option
+values are checked before the program runs (DTO itself silently falls back to a
+default on a value it does not understand). Only the options you pass are
+applied: a `DTO_*` variable you already exported is left untouched, an explicit
+option overrides it, and `-i/--ignore-env` drops all inherited `DTO_*`
+variables.
+
+The `libdto.so` path is resolved from `-l/--library`, then `$DTO_LIBRARY`, then
+the library installed with `dtoctl`, then the compiled-in default
 (`/usr/local/lib/libdto.so` for a CMake build, `/usr/lib64/libdto.so` for the
-Makefile build), and is prepended to any existing `LD_PRELOAD`.
+Makefile build). It is made absolute and prepended to any existing
+`LD_PRELOAD`, and `dtoctl` fails if the library cannot be read rather than
+running the program without DTO.
+
+To see what would run without running it, use `--dry-run`:
+
+```bash
+$ dtoctl --dry-run -w umwait -b 16K ./prog
+library: /usr/lib64/libdto.so.1.0 (compiled-in default)
+LD_PRELOAD=/usr/lib64/libdto.so.1.0
+DTO_WAIT_METHOD=umwait  # option
+DTO_MIN_BYTES=16384  # option
+command: ./prog
+```
+
+DSA work queues are often accessible to root only. Run `sudo dtoctl ...`
+rather than `dtoctl sudo ...`, which loses `LD_PRELOAD` and the `DTO_*`
+variables, and pass settings as options: `sudo` does not pass on variables
+exported in your shell.
 
 Run `dtoctl --help` for the option list, or `man 1 dtoctl` for the full manual,
 which documents each option and gives a ready-to-run command for each of the
