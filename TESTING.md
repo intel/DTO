@@ -59,6 +59,19 @@ hardware -- DTO falls back to CPU transparently.
 ctest -R functional
 ```
 
+## Stats Tests
+
+`stats` runs `dto-test-stats-workload`, which makes a known number of calls
+of known sizes, with `DTO_COLLECT_STATS` set, and checks the output: totals
+and histogram buckets, interval records adding up to the totals, calls from
+200 short-lived threads all counted without their stats memory piling up,
+separate records for a forked child, `%p` file names, and the text format.
+It needs Python 3 and no DSA hardware.
+
+```bash
+ctest -R stats
+```
+
 ## Performance Tests
 
 The performance test (`perf`) detects regressions in libdto by
