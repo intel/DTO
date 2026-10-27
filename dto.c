@@ -1270,10 +1270,10 @@ static int dsa_init(void)
 	const char *env_str;
 	char wq_list[256];
 
-	/* detect waitpkg support */
-	leaf = 7;
+	/* detect waitpkg support: CPUID.(EAX=7,ECX=0):ECX bit 5 */
+	leaf = 0;
 	waitpkg = 0;
-	if (__get_cpuid(0, &leaf, unused, &waitpkg, unused + 1)) {
+	if (__get_cpuid_count(7, 0, &leaf, unused, &waitpkg, unused + 1)) {
 		if (waitpkg & 0x20) {
 			LOG_TRACE("waitpkg supported\n");
 			waitpkg_support = 1;
@@ -1567,27 +1567,42 @@ static int init_dto(void)
 				use_std_lib_calls = 1;
 			}
 
-                        // calculate the wait time for TPAUSE
-                        if (wait_method == WAIT_TPAUSE) {
-    			        unsigned int num, den, freq;
-    			        unsigned int empty;
-    			        unsigned long long tmp;
-    			        __get_cpuid( 0x15, &den, &num, &freq, &empty );
-    			        freq /= 1000;
-    			        LOG_TRACE( "Core Freq = %u kHz\n", freq );
-    			        LOG_TRACE( "TSC Mult  = %u\n", num );
-    			        LOG_TRACE( "TSC Den   = %u\n", den );
-    			        freq *= num;
-    			        freq /= den;
-    			        LOG_TRACE( "CPU freq = %u kHz\n", freq );
+			/*
+			 * Calculate the wait time for TPAUSE. This converts ns to TSC
+			 * cycles using CPUID leaf 0x15, which may be absent or report a
+			 * zero denominator/crystal frequency (common in VMs and on
+			 * older parts), so verify it before dividing.
+			 */
+			if (!use_std_lib_calls && wait_method == WAIT_TPAUSE) {
+				unsigned int num = 0, den = 0, freq = 0;
+				unsigned int empty;
+				unsigned long long tmp;
 
-    			        LOG_TRACE( "Requested wait: %llu nsec\n", tpause_wait_time );
-    			        tmp = tpause_wait_time;
-    			        tmp *= freq;
-    			        tpause_wait_time = tmp / NSEC_PER_MSEC;
-    			        LOG_TRACE( "Requested wait duration: %llu cycles\n", tpause_wait_time );
-                        }
-    
+				if (!__get_cpuid(0x15, &den, &num, &freq, &empty) ||
+				    den == 0 || num == 0 || freq == 0) {
+					LOG_ERROR("CPUID leaf 0x15 unavailable (den=%u, num=%u, freq=%u); "
+						"cannot compute TSC frequency for tpause. Falling back to busypoll\n",
+						den, num, freq);
+					wait_method = WAIT_BUSYPOLL;
+					min_avg_waits = MIN_AVG_POLL_WAITS;
+					max_avg_waits = MAX_AVG_POLL_WAITS;
+				} else {
+					freq /= 1000;
+					LOG_TRACE("Core Freq = %u kHz\n", freq);
+					LOG_TRACE("TSC Mult  = %u\n", num);
+					LOG_TRACE("TSC Den   = %u\n", den);
+					freq *= num;
+					freq /= den;
+					LOG_TRACE("CPU freq = %u kHz\n", freq);
+
+					LOG_TRACE("Requested wait: %llu nsec\n", tpause_wait_time);
+					tmp = tpause_wait_time;
+					tmp *= freq;
+					tpause_wait_time = tmp / NSEC_PER_MSEC;
+					LOG_TRACE("Requested wait duration: %llu cycles\n", tpause_wait_time);
+				}
+			}
+
 			// display configuration
 			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
 				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d\n",
