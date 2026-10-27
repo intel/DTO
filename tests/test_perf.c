@@ -36,6 +36,7 @@
 #include "dto_test_utils.h"
 
 #include <stdint.h>
+#include <unistd.h>
 #include <sched.h>
 #include <dlfcn.h>
 #include <sys/mman.h>
