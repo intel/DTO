@@ -1,4 +1,7 @@
 dto-test*
 libdto.so*
+libdto_explicit.so*
 build*/
 tests/baselines*/
+dtoctl
+/doc/dtoctl.1

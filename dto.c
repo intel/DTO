@@ -1294,6 +1294,10 @@ static int dsa_init(void)
 				max_avg_waits = MAX_AVG_POLL_WAITS;
 			} else
 				LOG_ERROR("umwait not supported. Falling back to default wait method\n");
+		} else if (!strncmp(env_str, wait_names[WAIT_YIELD], strlen(wait_names[WAIT_YIELD]))) {
+			wait_method = WAIT_YIELD;
+			min_avg_waits = MIN_AVG_YIELD_WAITS;
+			max_avg_waits = MAX_AVG_YIELD_WAITS;
 		} else if (!strncmp(env_str, wait_names[WAIT_TPAUSE], strlen(wait_names[WAIT_TPAUSE]))) {
 		    if (waitpkg_support) {
 			wait_method = WAIT_TPAUSE;
