@@ -96,7 +96,6 @@ struct dto_wq {
 struct dto_device {
 	struct dto_wq* wqs[MAX_WQS];
 	uint8_t num_wqs;
-	atomic_uchar next_wq;
 };
 #endif
 
@@ -132,7 +131,11 @@ static struct dto_wq wqs[MAX_WQS];
 static struct dto_device* devices[MAX_NUMA_NODES];
 #endif
 static uint8_t num_wqs;
-static atomic_uchar next_wq;
+/* round-robin start position for the next thread that picks a WQ (get_wq) */
+static atomic_uint next_thread_wq;
+/* this thread's round-robin position */
+static __thread unsigned int thr_wq_rr;
+static __thread bool thr_wq_rr_set;
 static atomic_uchar dto_initialized;
 static atomic_uchar dto_initializing;
 static uint8_t use_std_lib_calls;
@@ -1646,6 +1649,21 @@ static void cleanup_dto(void)
 #endif
 }
 
+/* Next round-robin position for this thread. Each thread keeps its own, so
+ * picking a WQ writes no cache line shared with other threads; a counter
+ * incremented by every submit on every thread was measurable on small
+ * operations. Threads start at successive positions, so concurrent threads
+ * still spread across the WQs. */
+static __always_inline unsigned int thread_wq_rr(void)
+{
+	if (unlikely(!thr_wq_rr_set)) {
+		thr_wq_rr = atomic_fetch_add_explicit(&next_thread_wq, 1,
+						      memory_order_relaxed);
+		thr_wq_rr_set = true;
+	}
+	return thr_wq_rr++;
+}
+
 static __always_inline  struct dto_wq *get_wq(void* buf)
 {
 	struct dto_wq* wq = NULL;
@@ -1660,14 +1678,14 @@ static __always_inline  struct dto_wq *get_wq(void* buf)
 			struct dto_device* dev = devices[numa_node];
 			if (dev != NULL &&
 				dev->num_wqs > 0) {
-				wq = dev->wqs[dev->next_wq++ % dev->num_wqs];
+				wq = dev->wqs[thread_wq_rr() % dev->num_wqs];
 			}
 		}
 	}
 #endif
 
 	if (wq == NULL) {
-		wq = &wqs[next_wq++ % num_wqs];
+		wq = &wqs[thread_wq_rr() % num_wqs];
 	}
 
 	return wq;
