@@ -124,6 +124,47 @@ if (HAS_WAITPKG)
   endforeach()
 endif()
 
+# Build dtoctl.  By default it preloads the libdto.so installed alongside it,
+# found relative to the dtoctl binary so "cmake --install --prefix" still works,
+# and falls back to the configured install path.  Set DTOCTL_LIBPATH to always
+# preload a specific library instead.
+set(DTOCTL_LIBPATH "" CACHE FILEPATH
+    "Path to libdto.so that dtoctl preloads by default (empty: the installed libdto.so)")
+add_executable(dtoctl dtoctl.c)
+target_compile_definitions(dtoctl PRIVATE DTO_VERSION="${PROJECT_VERSION}")
+if(DTOCTL_LIBPATH)
+    target_compile_definitions(dtoctl PRIVATE LIBDTO_PATH="${DTOCTL_LIBPATH}")
+else()
+    # Not cached, so it follows later changes to CMAKE_INSTALL_PREFIX.
+    get_filename_component(DTOCTL_LIBDIR "${CMAKE_INSTALL_LIBDIR}" ABSOLUTE
+        BASE_DIR "${CMAKE_INSTALL_PREFIX}")
+    get_filename_component(DTOCTL_BINDIR "${CMAKE_INSTALL_BINDIR}" ABSOLUTE
+        BASE_DIR "${CMAKE_INSTALL_PREFIX}")
+    file(RELATIVE_PATH DTOCTL_REL_LIBPATH "${DTOCTL_BINDIR}" "${DTOCTL_LIBDIR}/libdto.so")
+    target_compile_definitions(dtoctl PRIVATE
+        LIBDTO_PATH="${DTOCTL_LIBDIR}/libdto.so"
+        LIBDTO_REL_PATH="${DTOCTL_REL_LIBPATH}")
+endif()
+install(TARGETS dtoctl RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# Build and install the optional section 1 manual.
+find_program(PANDOC_EXECUTABLE NAMES pandoc)
+if(PANDOC_EXECUTABLE)
+    set(DTOCTL_MAN_PAGE "${CMAKE_CURRENT_BINARY_DIR}/doc/dtoctl.1")
+    add_custom_command(
+        OUTPUT "${DTOCTL_MAN_PAGE}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/doc"
+        COMMAND "${PANDOC_EXECUTABLE}" --standalone --to=man
+                "${CMAKE_CURRENT_SOURCE_DIR}/doc/dtoctl.md" -o "${DTOCTL_MAN_PAGE}"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/doc/dtoctl.md"
+        COMMENT "Generating dtoctl(1) manual"
+        VERBATIM)
+    add_custom_target(dtoctl-man ALL DEPENDS "${DTOCTL_MAN_PAGE}")
+    install(FILES "${DTOCTL_MAN_PAGE}" DESTINATION ${CMAKE_INSTALL_MANDIR}/man1)
+else()
+    message(STATUS "Skipping dtoctl manual generation and installation: install pandoc to build the man page.")
+endif()
+
 # Build dto-test and dto-test-wodto
 add_executable(dto-test dto-test.c)
 target_link_libraries(dto-test PRIVATE DTO::dto pthread)
@@ -158,6 +199,14 @@ if(DTO_BUILD_TESTS)
             TIMEOUT 120
         )
     endif()
+    # dtoctl option handling and environment setup (no DSA hardware needed)
+    add_test(NAME dtoctl
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_dtoctl.sh
+                $<TARGET_FILE:dtoctl> $<TARGET_FILE:dto>)
+    set_tests_properties(dtoctl PROPERTIES
+        LABELS "functional"
+        TIMEOUT 60
+    )
 
     # ---- A/B performance regression test ----
     # The baseline object is compiled from unguarded upstream sources that
