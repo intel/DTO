@@ -71,6 +71,7 @@ Following environment variables control the behavior of DTO library:
    DTO_UMWAIT_DELAY=xxxx defines delay for umwait command (check max possible value at: /sys/devices/system/cpu/umwait_control/max_time), default is 100000
 	DTO_LOG_FILE=<dto log file path> Redirect the DTO output to the specified file instead of std output (useful for debugging and statistics collection). file name is suffixed by the program name and process pid (<path>.<program>.<pid>).
 	DTO_LOG_LEVEL=0/1/2 controls the log level. higher value means more verbose logging (default 0).
+	DTO_CRC_MIN_BYTES=xxxx smallest buffer dto_crc32c_with_seed() sends to DSA; smaller ones are checksummed on the CPU (default: DTO_MIN_BYTES).
 ```
 
 Although not the only usage models of DTO, the following are some common ones:
@@ -95,6 +96,50 @@ Although not the only usage models of DTO, the following are some common ones:
       DTO_WAIT_METHOD=yield or umwait (saves either cycles or power)
 
 
+## Explicit asynchronous API
+
+Besides intercepting the libc calls, libdto exports an explicit submit/poll
+API, declared in `dto.h`, for applications that want to overlap DSA work with
+their own: copy, fill, CRC32C (optionally fused with a copy), compare, compare
+against a pattern and translation fetch, each as a single operation or batched
+(up to 1024 operations in one DSA batch descriptor).
+
+```c
+#include <dto.h>
+
+dto_async_op op;                    /* caller-owned, 64-byte aligned */
+
+if (dto_submit_memcpy_crc(&op, dst, src, n, DTO_SUBMIT_CC) ==
+    DTO_ASYNC_SUBMITTED) {
+	do_other_work();
+	dto_async_wait(&op);            /* waits with DTO_WAIT_METHOD */
+	if (dto_async_poll(&op) == DTO_ASYNC_DONE)
+		crc = dto_async_crc_val(&op);
+	else
+		redo_on_cpu();
+} else {                            /* DTO_ASYNC_FALLBACK: nothing was done */
+	redo_on_cpu();
+}
+```
+
+A batch is built with `dto_batch_create`, `dto_batch_add_*` and
+`dto_batch_submit`; `dto_batch_poll` redoes on the CPU anything the device
+could not finish, so once it returns `DTO_ASYNC_DONE` every result is valid.
+
+Explicit submits are not subject to `DTO_MIN_BYTES`: the caller decides what to
+offload. `DTO_SUBMIT_BOF` makes the device wait for page faults to be
+resolved; it requires a work queue configured with block-on-fault
+(`accel-config config-wq --block-on-fault=1`), and on one without it the
+device rejects the operation. Without the flag a page fault stops the
+operation partway, on any work queue. `dto_async_crc_val` and `dto_batch_crc`
+return the raw CRC32C (the SSE4.2 `crc32` instruction applied from 0, no final
+inversion); the seeded `*_crc32c` calls return standard CRC32C and chain across
+buffers. See `dto.h` for the full contract.
+
+Programs that only use this API, and must not have their own large libc copies
+sent to DSA, can link `libdto_explicit` instead: the same library without the
+memcpy/memset/memmove/memcmp interposers (`-ldto_explicit`, or
+`DTO::dto_explicit` from CMake).
 ## Using dtoctl
 
 Setting `LD_PRELOAD` and exporting the `DTO_*` environment variables by hand is
@@ -180,6 +225,7 @@ The accel-config and libnuma dependencies are optional and can be disabled at co
 | `DTO_NUMA_SUPPORT` | `ON` | Use libnuma for NUMA-aware work queue selection. When disabled, libdto does not link against libnuma and the `DTO_IS_NUMA_AWARE` environment variable has no effect (work queues are used in round-robin order). |
 | `DTO_STATIC_ACCEL_CONFIG` | `OFF` | Statically link libaccel-config into libdto.so instead of depending on the shared library at runtime. Requires `libaccel-config.a` to be installed. |
 | `DTO_STATIC_NUMA` | `OFF` | Statically link libnuma into libdto.so instead of depending on the shared library at runtime. Requires a `libnuma.a` compiled with `-fPIC`. |
+| `DTO_BUILD_EXPLICIT` | `ON` | Also build `libdto_explicit`, the explicit API (`dto.h`) without the libc interposers. |
 
 Example: build without either dependency:
 ```bash

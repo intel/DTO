@@ -59,6 +59,26 @@ hardware -- DTO falls back to CPU transparently.
 ctest -R functional
 ```
 
+They also cover the explicit asynchronous API (`dto.h`): every submit and
+batch operation is checked against the CPU result, including the CPU repair of
+batch operations the device could not finish. `functional_explicit` runs the
+same tests against `libdto_explicit`.
+
+Because every explicit operation may legitimately fall back to the CPU, a
+broken offload path would still pass. On a machine with a usable work queue,
+set `DTO_TEST_EXPECT_DSA` to require that operations on faulted-in buffers are
+submitted and completed by the device:
+
+```bash
+sudo DTO_TEST_EXPECT_DSA=1 ./dto-test-functional
+sudo DTO_TEST_EXPECT_DSA=1 ./dto-test-functional-explicit
+```
+
+`test_async_bof` checks the block-on-fault behavior against whichever setting
+the work queue has (it reports which), so run the suite once with
+`block_on_fault` enabled and once without to cover both. It assumes all work
+queues DTO uses share the same setting.
+
 ## dtoctl Tests
 
 Checks for the `dtoctl` wrapper: every option sets its `DTO_*` variable,

@@ -16,6 +16,8 @@
 #include <linux/limits.h>
 #include <cpuid.h>
 #include <linux/idxd.h>
+
+#include "dto.h"
 #include <x86intrin.h>
 #include <sched.h>
 #include <sys/stat.h>
@@ -64,7 +66,9 @@
 #define NSEC_PER_MSEC (NSEC_PER_SEC/MSEC_PER_SEC)
 
 // thread specific variables
+#ifndef DTO_NO_LIBC_INTERPOSE
 static __thread struct dsa_hw_desc thr_desc;
+#endif
 static __thread struct dsa_completion_record thr_comp __attribute__((aligned(32)));
 static __thread uint64_t thr_bytes_completed;
 
@@ -82,6 +86,7 @@ struct dto_wq {
 	uint64_t dsa_gencap;
 	int wq_size;
 	uint32_t max_transfer_size;
+	uint32_t max_batch_size;
 	int wq_fd;
 	void *wq_portal;
 	bool wq_mmapped;
@@ -133,6 +138,9 @@ static atomic_uchar dto_initializing;
 static uint8_t use_std_lib_calls;
 static enum numa_aware is_numa_aware;
 static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
+/* DTO_CRC_MIN_BYTES: smallest dto_crc32c_with_seed() sent to DSA; 0 follows
+ * dsa_min_size */
+static size_t crc_min_size;
 static int wait_method = WAIT_BUSYPOLL;
 static size_t cpu_size_fraction;   // range of values is 0 to 99
 
@@ -998,6 +1006,12 @@ static int dsa_init_from_wq_list(char *wq_list)
 			goto fail_wq;
 		}
 
+		wqs[num_wqs].max_batch_size = dto_get_param_ullong(dir_fd, "max_batch_size", &rc);
+		if (rc) {
+			close(dir_fd);
+			goto fail_wq;
+		}
+
 		dto_get_param_string(dir_fd, "mode", wq_mode);
 
 		if (wq_mode[0] == '\0') {
@@ -1161,6 +1175,7 @@ static int dsa_init_from_accfg(void)
 
 			wqs[num_wqs].wq_size = accfg_wq_get_size(wq);
 			wqs[num_wqs].max_transfer_size = accfg_wq_get_max_transfer_size(wq);
+			wqs[num_wqs].max_batch_size = accfg_wq_get_max_batch_size(wq);
 
 			wqs[num_wqs].acc_wq = wq;
 			wqs[num_wqs].dsa_gencap = accfg_device_get_gen_cap(device);
@@ -1488,6 +1503,15 @@ static int init_dto(void)
 					dsa_min_size = DTO_DEFAULT_MIN_SIZE;
 			}
 
+			env_str = getenv("DTO_CRC_MIN_BYTES");
+
+			if (env_str != NULL) {
+				errno = 0;
+				crc_min_size = strtoul(env_str, NULL, 10);
+				if (errno)
+					crc_min_size = 0;
+			}
+
 			double cpu_size_fraction_float = 0.0;
 			env_str = getenv("DTO_CPU_SIZE_FRACTION");
 
@@ -1634,14 +1658,22 @@ static __always_inline  struct dto_wq *get_wq(void* buf)
 	return wq;
 }
 
+/* 8-byte MEMFILL pattern for the byte value c (like memset) */
+static __always_inline uint64_t memfill_pattern(int c)
+{
+	return 0x0101010101010101ULL * (uint8_t)c;
+}
+
+/* libdto_explicit (DTO_NO_LIBC_INTERPOSE) leaves libc's memset, memcpy,
+ * memmove and memcmp alone: programs that use it call the dto_* API below
+ * directly. */
+#ifndef DTO_NO_LIBC_INTERPOSE
+
 static void dto_memset(void *s, int c, size_t n, int *result)
 {
-	uint64_t memset_pattern;
+	uint64_t memset_pattern = memfill_pattern(c);
 	size_t cpu_size, dsa_size;
 	struct dto_wq *wq = get_wq(s);
-
-	for (int i = 0; i < 8; ++i)
-		((uint8_t *) &memset_pattern)[i] = (uint8_t) c;
 
 	thr_desc.opcode = DSA_OPCODE_MEMFILL;
 	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
@@ -2153,4 +2185,867 @@ int memcmp(const void *s1, const void *s2, size_t n)
 #endif
 	}
 	return ret;
+}
+
+#endif /* DTO_NO_LIBC_INTERPOSE */
+
+/*******************************************************************************
+ * Explicit asynchronous submit/poll API (see dto.h).
+ ******************************************************************************/
+
+/* CRC presentations. With its default CRC flags the device inverts both the
+ * seed and the result: the iSCSI presentation, in which seed 0 gives the
+ * standard CRC32C and a previous result chains. The crc32c calls return it
+ * unchanged. The raw CRC32C of dto_async_crc_val/dto_batch_crc -- the SSE4.2
+ * crc32 loop from 0, no final inversion -- is the same computation seeded
+ * with ~0 and inverted back. */
+#define DSA_CRC_SEED_RAW	0xFFFFFFFFu
+#define DSA_CRC_VAL_TO_RAW(v)	((uint32_t)~(uint32_t)(v))
+
+/* ENQCMD to a shared WQ can transiently fail when the queue is full;
+ * retry briefly before giving up so momentary bursts don't push work
+ * back onto the CPU. A batch carries more work, so it tries longer. */
+#define ASYNC_SUBMIT_RETRIES 16
+#define BATCH_SUBMIT_RETRIES 64
+
+/* Failed async completions are logged at most this many times per process:
+ * poll may legitimately be called repeatedly on a failed op. */
+#define ASYNC_FAIL_LOG_LIMIT 3
+
+/* dto_async_wait() must not wait for a status byte no device will ever
+ * write: an op whose submit fell back, or one never submitted at all (ops
+ * are usually stack variables, so their storage starts out as garbage).
+ * Every submit clears the mark first and sets it once the descriptor is
+ * enqueued; garbage matching it by chance is a 2^-32 event. */
+#define DTO_OP_SUBMITTED_MAGIC 0x64746F53u	/* "dtoS" */
+
+struct dto_async_op_impl {
+	struct dsa_hw_desc desc;	/* 64 bytes, 64-aligned via dto_async_op */
+	struct dsa_completion_record comp __attribute__((aligned(32)));
+	uint32_t submitted;
+};
+_Static_assert(sizeof(struct dto_async_op_impl) <= sizeof(dto_async_op),
+	       "dto_async_op opaque storage too small");
+_Static_assert(sizeof(struct dsa_hw_desc) == 64, "unexpected descriptor size");
+
+typedef uint64_t __attribute__((may_alias, aligned(1))) unaligned_u64;
+
+/* CRC32C on the CPU in the device's presentation for the given seed, so a
+ * value the library computes matches what the device returns for the same
+ * descriptor. */
+__attribute__((target("sse4.2")))
+static uint32_t cpu_crc32c(uint32_t seed, const void *buf, size_t n)
+{
+	const uint8_t *p = buf;
+	uint64_t crc = (uint32_t)~seed;
+
+	for (; n >= 8; n -= 8, p += 8)
+		crc = _mm_crc32_u64(crc, *(const unaligned_u64 *)p);
+	for (; n; n--)
+		crc = _mm_crc32_u8((uint32_t)crc, *p++);
+	return ~(uint32_t)crc;
+}
+
+static __always_inline uint32_t async_desc_flags(const struct dto_wq *wq,
+						 unsigned int flags,
+						 bool has_dest)
+{
+	uint32_t f = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+
+	/* Passed as given: a work queue configured without block-on-fault
+	 * fails the descriptor with DSA_COMP_INVALID_FLAGS, and without the
+	 * flag a page fault stops the operation partway (see dto.h). */
+	if (flags & DTO_SUBMIT_BOF)
+		f |= IDXD_OP_FLAG_BOF;
+	/* CC is only legal for operations with a destination; CRC Generation
+	 * would be failed by the device with DSA_COMP_INVALID_FLAGS. */
+	if ((flags & DTO_SUBMIT_CC) && has_dest &&
+	    (wq->dsa_gencap & GENCAP_CC_MEMORY))
+		f |= IDXD_OP_FLAG_CC;
+	return f;
+}
+
+static int async_submit(struct dto_wq *wq, struct dsa_hw_desc *desc,
+			int retries)
+{
+	for (int attempt = 0; attempt < retries; attempt++) {
+		int rc = dsa_submit(wq, desc);
+
+		if (rc == SUCCESS)
+			return DTO_ASYNC_SUBMITTED;
+		if (rc != RETRY)
+			break;
+		_mm_pause();
+	}
+	return DTO_ASYNC_FALLBACK;
+}
+
+static void async_log_failure(uint8_t status, uint32_t opcode, uint32_t size)
+{
+	static int fail_logged;
+
+	if (fail_logged < ASYNC_FAIL_LOG_LIMIT &&
+	    __atomic_fetch_add(&fail_logged, 1, __ATOMIC_RELAXED) <
+	    ASYNC_FAIL_LOG_LIMIT)
+		LOG_ERROR("async op failed with status %x (opcode %x, size %x)\n",
+			  status, opcode, size);
+}
+
+/* Completion record status -> DTO_ASYNC_{PENDING,DONE,FAILED} */
+static int async_comp_result(const struct dsa_completion_record *comp,
+			     uint32_t opcode, uint32_t size)
+{
+	uint8_t status = __atomic_load_n((const uint8_t *)&comp->status,
+					 __ATOMIC_ACQUIRE);
+
+	if (status == 0)
+		return DTO_ASYNC_PENDING;
+	if (likely((status & DSA_COMP_STATUS_MASK) == DSA_COMP_SUCCESS))
+		return DTO_ASYNC_DONE;
+	async_log_failure(status, opcode, size);
+	return DTO_ASYNC_FAILED;
+}
+
+/* Common part of every single-op submit. NULL means fall back, with nothing
+ * submitted; otherwise the descriptor is set up but for its operands. hint
+ * picks the work queue (NUMA-aware selection uses its node). */
+static struct dto_wq *async_prepare(struct dto_async_op_impl *impl,
+				    uint32_t opcode, const void *hint,
+				    size_t n, unsigned int flags, bool has_dest)
+{
+	struct dto_wq *wq;
+
+	impl->submitted = 0;
+	if (!dto_initialized || use_std_lib_calls)
+		return NULL;
+	/* The completion record must be 32-byte aligned. dto_async_op is
+	 * declared 64-byte aligned, but a malloc'ed op need not be. */
+	if (n == 0 || ((uintptr_t)impl & 31) != 0)
+		return NULL;
+	wq = get_wq((void *)hint);
+	if (unlikely(wq == NULL) || n > wq->max_transfer_size)
+		return NULL;
+
+	orig_memset(&impl->desc, 0, sizeof(impl->desc));
+	impl->desc.opcode = opcode;
+	impl->desc.flags = async_desc_flags(wq, flags, has_dest);
+	impl->desc.completion_addr = (uint64_t)&impl->comp;
+	impl->desc.xfer_size = (uint32_t)n;
+	impl->comp.status = 0;
+	return wq;
+}
+
+static int async_enqueue(struct dto_async_op_impl *impl, struct dto_wq *wq)
+{
+	if (async_submit(wq, &impl->desc, ASYNC_SUBMIT_RETRIES) !=
+	    DTO_ASYNC_SUBMITTED)
+		return DTO_ASYNC_FALLBACK;
+	impl->submitted = DTO_OP_SUBMITTED_MAGIC;
+	return DTO_ASYNC_SUBMITTED;
+}
+
+__attribute__((visibility("default")))
+int dto_submit_memcpy(dto_async_op *op, void *dest, const void *src,
+		      size_t n, unsigned int flags)
+{
+	struct dto_async_op_impl *impl = (struct dto_async_op_impl *)op;
+	struct dto_wq *wq = async_prepare(impl, DSA_OPCODE_MEMMOVE, dest, n,
+					  flags, true);
+
+	if (wq == NULL)
+		return DTO_ASYNC_FALLBACK;
+	impl->desc.src_addr = (uint64_t)src;
+	impl->desc.dst_addr = (uint64_t)dest;
+	return async_enqueue(impl, wq);
+}
+
+__attribute__((visibility("default")))
+int dto_submit_memfill(dto_async_op *op, void *dest, uint64_t pattern,
+		       size_t n, unsigned int flags)
+{
+	struct dto_async_op_impl *impl = (struct dto_async_op_impl *)op;
+	struct dto_wq *wq = async_prepare(impl, DSA_OPCODE_MEMFILL, dest, n,
+					  flags, true);
+
+	if (wq == NULL)
+		return DTO_ASYNC_FALLBACK;
+	impl->desc.pattern = pattern;
+	impl->desc.dst_addr = (uint64_t)dest;
+	return async_enqueue(impl, wq);
+}
+
+__attribute__((visibility("default")))
+int dto_submit_memset(dto_async_op *op, void *dest, int c, size_t n,
+		      unsigned int flags)
+{
+	return dto_submit_memfill(op, dest, memfill_pattern(c), n, flags);
+}
+
+static int submit_crc_common(dto_async_op *op, uint32_t opcode, void *dest,
+			     const void *src, size_t n, uint32_t seed,
+			     unsigned int flags)
+{
+	struct dto_async_op_impl *impl = (struct dto_async_op_impl *)op;
+	struct dto_wq *wq = async_prepare(impl, opcode, dest ? dest : src, n,
+					  flags, dest != NULL);
+
+	if (wq == NULL)
+		return DTO_ASYNC_FALLBACK;
+	impl->desc.src_addr = (uint64_t)src;
+	impl->desc.dst_addr = (uint64_t)dest;
+	impl->desc.crc_seed = seed;
+	return async_enqueue(impl, wq);
+}
+
+__attribute__((visibility("default")))
+int dto_submit_memcpy_crc(dto_async_op *op, void *dest, const void *src,
+			  size_t n, unsigned int flags)
+{
+	return submit_crc_common(op, DSA_OPCODE_COPY_CRC, dest, src, n,
+				 DSA_CRC_SEED_RAW, flags);
+}
+
+__attribute__((visibility("default")))
+int dto_submit_crc(dto_async_op *op, const void *src, size_t n,
+		   unsigned int flags)
+{
+	return submit_crc_common(op, DSA_OPCODE_CRCGEN, NULL, src, n,
+				 DSA_CRC_SEED_RAW, flags);
+}
+
+__attribute__((visibility("default")))
+int dto_submit_memcpy_crc32c(dto_async_op *op, void *dest, const void *src,
+			     size_t n, uint32_t seed, unsigned int flags)
+{
+	return submit_crc_common(op, DSA_OPCODE_COPY_CRC, dest, src, n, seed,
+				 flags);
+}
+
+__attribute__((visibility("default")))
+int dto_submit_crc32c(dto_async_op *op, const void *src, size_t n,
+		      uint32_t seed, unsigned int flags)
+{
+	return submit_crc_common(op, DSA_OPCODE_CRCGEN, NULL, src, n, seed,
+				 flags);
+}
+
+__attribute__((visibility("default")))
+int dto_submit_compare(dto_async_op *op, const void *src1, const void *src2,
+		       size_t n, unsigned int flags)
+{
+	struct dto_async_op_impl *impl = (struct dto_async_op_impl *)op;
+	struct dto_wq *wq = async_prepare(impl, DSA_OPCODE_COMPARE, src1, n,
+					  flags, false);
+
+	if (wq == NULL)
+		return DTO_ASYNC_FALLBACK;
+	impl->desc.src_addr = (uint64_t)src1;
+	impl->desc.src2_addr = (uint64_t)src2;
+	return async_enqueue(impl, wq);
+}
+
+__attribute__((visibility("default")))
+int dto_submit_compval(dto_async_op *op, const void *src, uint64_t pattern,
+		       size_t n, unsigned int flags)
+{
+	struct dto_async_op_impl *impl = (struct dto_async_op_impl *)op;
+	struct dto_wq *wq = async_prepare(impl, DSA_OPCODE_COMPVAL, src, n,
+					  flags, false);
+
+	if (wq == NULL)
+		return DTO_ASYNC_FALLBACK;
+	impl->desc.src_addr = (uint64_t)src;
+	/* Compare Pattern takes its pattern from the second operand slot;
+	 * the first one is the source (it is Memory Fill's pattern slot). */
+	impl->desc.comp_pattern = pattern;
+	return async_enqueue(impl, wq);
+}
+
+__attribute__((visibility("default")))
+int dto_submit_transl_fetch(dto_async_op *op, const void *addr, size_t n,
+			    unsigned int flags)
+{
+	struct dto_async_op_impl *impl = (struct dto_async_op_impl *)op;
+	struct dto_wq *wq = async_prepare(impl, DSA_OPCODE_TRANSL_FETCH, addr,
+					  n, flags, false);
+
+	if (wq == NULL)
+		return DTO_ASYNC_FALLBACK;
+	/* region_size shares the xfer_size slot async_prepare filled in */
+	impl->desc.transl_fetch_addr = (uint64_t)addr;
+	impl->desc.region_stride = 0;	/* one contiguous region */
+	return async_enqueue(impl, wq);
+}
+
+__attribute__((visibility("default")))
+int dto_async_poll(dto_async_op *op)
+{
+	struct dto_async_op_impl *impl = (struct dto_async_op_impl *)op;
+
+	return async_comp_result(&impl->comp, impl->desc.opcode,
+				 impl->desc.xfer_size);
+}
+
+__attribute__((visibility("default")))
+void dto_async_wait(dto_async_op *op)
+{
+	struct dto_async_op_impl *impl = (struct dto_async_op_impl *)op;
+
+	if (impl->submitted != DTO_OP_SUBMITTED_MAGIC)
+		return;
+	dsa_wait_no_adjust(&impl->comp.status);
+	/* order the status byte ahead of the caller's reads of the record */
+	atomic_thread_fence(memory_order_acquire);
+}
+
+__attribute__((visibility("default")))
+int dto_wait_blocks(void)
+{
+	return 0;
+}
+
+__attribute__((visibility("default")))
+uint32_t dto_async_crc_val(const dto_async_op *op)
+{
+	const struct dto_async_op_impl *impl =
+		(const struct dto_async_op_impl *)op;
+	return DSA_CRC_VAL_TO_RAW(impl->comp.crc_val);
+}
+
+__attribute__((visibility("default")))
+uint32_t dto_async_crc32c_val(const dto_async_op *op)
+{
+	const struct dto_async_op_impl *impl =
+		(const struct dto_async_op_impl *)op;
+	return (uint32_t)impl->comp.crc_val;
+}
+
+__attribute__((visibility("default")))
+int dto_async_result(const dto_async_op *op)
+{
+	const struct dto_async_op_impl *impl =
+		(const struct dto_async_op_impl *)op;
+	return impl->comp.result;
+}
+
+__attribute__((visibility("default")))
+uint32_t dto_async_bytes_completed(const dto_async_op *op)
+{
+	const struct dto_async_op_impl *impl =
+		(const struct dto_async_op_impl *)op;
+	return impl->comp.bytes_completed;
+}
+
+__attribute__((visibility("default")))
+int dto_async_status(const dto_async_op *op)
+{
+	const struct dto_async_op_impl *impl =
+		(const struct dto_async_op_impl *)op;
+	return __atomic_load_n((const uint8_t *)&impl->comp.status,
+			       __ATOMIC_ACQUIRE) & DSA_COMP_STATUS_MASK;
+}
+
+__attribute__((visibility("default")))
+uint32_t dto_crc32c_with_seed(uint32_t seed, const void *src, size_t n)
+{
+	size_t min_size = crc_min_size ? crc_min_size : dsa_min_size;
+	dto_async_op op;
+
+	/* No DTO_SUBMIT_BOF, so this works on any work queue: a page fault
+	 * stops the device and the CRC is computed on the CPU instead. */
+	if (n >= min_size &&
+	    dto_submit_crc32c(&op, src, n, seed, 0) == DTO_ASYNC_SUBMITTED) {
+		dto_async_wait(&op);
+		if (dto_async_poll(&op) == DTO_ASYNC_DONE)
+			return dto_async_crc32c_val(&op);
+	}
+	return cpu_crc32c(seed, src, n);
+}
+
+/* ---- Batches (see dto.h) ---- */
+
+/* Zero storage the library owns. Once DTO is up that is libc's memset, so it
+ * costs no detour through the interposer and a tiny DTO_MIN_BYTES never sends
+ * it to the device; before that, memset() itself, which copes with an
+ * uninitialized DTO (and is libc's in libdto_explicit). */
+static void lib_zero(void *p, size_t n)
+{
+	if (orig_memset)
+		orig_memset(p, 0, n);
+	else
+		memset(p, 0, n);
+}
+
+enum batch_state {
+	BATCH_BUILDING = 0,	/* accepting operations */
+	BATCH_SUBMITTED,	/* in flight */
+	BATCH_REPAIRING,	/* one poller is redoing failed operations */
+	BATCH_DONE,
+};
+
+struct dto_batch {
+	struct dsa_hw_desc desc __attribute__((aligned(64)));	/* the Batch descriptor */
+	struct dsa_completion_record comp __attribute__((aligned(32)));
+	struct dsa_hw_desc *descs;		/* [cap], 64-byte aligned */
+	struct dsa_completion_record *comps;	/* [cap], 32-byte aligned */
+	const void *hint;			/* first operand: picks the WQ */
+	int cap;
+	int count;
+	_Atomic int state;
+};
+
+/* The record that completes the batch: the Batch descriptor's, or for a
+ * single operation, sent as a plain descriptor, that operation's own. */
+static __always_inline volatile uint8_t *batch_status(dto_batch *b)
+{
+	return b->count == 1 ? &b->comps[0].status : &b->comp.status;
+}
+
+/* Wait out a batch the device may still be writing to. */
+static void batch_quiesce(dto_batch *b)
+{
+	if (atomic_load_explicit(&b->state, memory_order_acquire) ==
+	    BATCH_SUBMITTED)
+		dsa_wait_no_adjust(batch_status(b));
+	while (atomic_load_explicit(&b->state, memory_order_acquire) ==
+	       BATCH_REPAIRING)
+		_mm_pause();
+}
+
+__attribute__((visibility("default")))
+dto_batch *dto_batch_create(int capacity)
+{
+	void *b = NULL, *descs = NULL, *comps = NULL;
+
+	if (capacity < 1)
+		return NULL;
+	if (capacity > DTO_BATCH_MAX)
+		capacity = DTO_BATCH_MAX;
+	if (posix_memalign(&b, 64, sizeof(struct dto_batch)) ||
+	    posix_memalign(&descs, 64, sizeof(struct dsa_hw_desc) * capacity) ||
+	    posix_memalign(&comps, 32,
+			   sizeof(struct dsa_completion_record) * capacity)) {
+		free(b);
+		free(descs);
+		return NULL;
+	}
+	/* operations zero their own descriptor and record when added */
+	lib_zero(b, sizeof(struct dto_batch));
+	((struct dto_batch *)b)->descs = descs;
+	((struct dto_batch *)b)->comps = comps;
+	((struct dto_batch *)b)->cap = capacity;
+	return b;
+}
+
+__attribute__((visibility("default")))
+void dto_batch_destroy(dto_batch *b)
+{
+	if (b == NULL)
+		return;
+	batch_quiesce(b);
+	free(b->descs);
+	free(b->comps);
+	free(b);
+}
+
+__attribute__((visibility("default")))
+void dto_batch_reset(dto_batch *b)
+{
+	batch_quiesce(b);
+	b->count = 0;
+	b->hint = NULL;
+	atomic_store_explicit(&b->state, BATCH_BUILDING, memory_order_relaxed);
+}
+
+__attribute__((visibility("default")))
+int dto_batch_count(const dto_batch *b)
+{
+	return b->count;
+}
+
+/* Descriptor for the next operation, or NULL (with *index unset) when the
+ * batch is full or submitted or n is out of range. BOF is set as requested;
+ * CC is recorded as requested and settled at submit, once the work queue
+ * (and so the device's cache-control support) is known. */
+static struct dsa_hw_desc *batch_add(dto_batch *b, uint32_t opcode,
+				     const void *hint, size_t n,
+				     unsigned int flags, bool has_dest,
+				     int *index)
+{
+	struct dsa_hw_desc *d;
+	int i;
+
+	if (atomic_load_explicit(&b->state, memory_order_relaxed) !=
+	    BATCH_BUILDING || b->count >= b->cap || n == 0 || n > UINT32_MAX)
+		return NULL;
+	i = b->count++;
+	d = &b->descs[i];
+	lib_zero(d, sizeof(*d));
+	d->opcode = opcode;
+	d->flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	if (flags & DTO_SUBMIT_BOF)
+		d->flags |= IDXD_OP_FLAG_BOF;
+	if ((flags & DTO_SUBMIT_CC) && has_dest)
+		d->flags |= IDXD_OP_FLAG_CC;
+	d->completion_addr = (uint64_t)&b->comps[i];
+	d->xfer_size = (uint32_t)n;
+	lib_zero(&b->comps[i], sizeof(b->comps[i]));
+	if (b->hint == NULL)
+		b->hint = hint;
+	*index = i;
+	return d;
+}
+
+__attribute__((visibility("default")))
+int dto_batch_add_memmove(dto_batch *b, void *dst, const void *src, size_t n,
+			  unsigned int flags)
+{
+	int i;
+	struct dsa_hw_desc *d = batch_add(b, DSA_OPCODE_MEMMOVE, dst, n, flags,
+					  true, &i);
+
+	if (d == NULL)
+		return -1;
+	d->src_addr = (uint64_t)src;
+	d->dst_addr = (uint64_t)dst;
+	return i;
+}
+
+__attribute__((visibility("default")))
+int dto_batch_add_memfill(dto_batch *b, void *dst, uint64_t pattern, size_t n,
+			  unsigned int flags)
+{
+	int i;
+	struct dsa_hw_desc *d = batch_add(b, DSA_OPCODE_MEMFILL, dst, n, flags,
+					  true, &i);
+
+	if (d == NULL)
+		return -1;
+	d->pattern = pattern;
+	d->dst_addr = (uint64_t)dst;
+	return i;
+}
+
+__attribute__((visibility("default")))
+int dto_batch_add_dualcast(dto_batch *b, void *dst1, void *dst2,
+			   const void *src, size_t n, unsigned int flags)
+{
+	struct dsa_hw_desc *d;
+	int i;
+
+	/* the device requires both destinations to agree in bits 11:0 */
+	if ((((uintptr_t)dst1 ^ (uintptr_t)dst2) & 0xfff) != 0)
+		return -1;
+	d = batch_add(b, DSA_OPCODE_DUALCAST, dst1, n, flags, true, &i);
+	if (d == NULL)
+		return -1;
+	d->src_addr = (uint64_t)src;
+	d->dst_addr = (uint64_t)dst1;
+	d->dest2 = (uint64_t)dst2;
+	return i;
+}
+
+__attribute__((visibility("default")))
+int dto_batch_add_crc(dto_batch *b, const void *src, size_t n,
+		      unsigned int flags)
+{
+	int i;
+	struct dsa_hw_desc *d = batch_add(b, DSA_OPCODE_CRCGEN, src, n, flags,
+					  false, &i);
+
+	if (d == NULL)
+		return -1;
+	d->src_addr = (uint64_t)src;
+	d->crc_seed = DSA_CRC_SEED_RAW;
+	return i;
+}
+
+__attribute__((visibility("default")))
+int dto_batch_add_memcpy_crc(dto_batch *b, void *dst, const void *src,
+			     size_t n, unsigned int flags)
+{
+	int i;
+	struct dsa_hw_desc *d = batch_add(b, DSA_OPCODE_COPY_CRC, dst, n, flags,
+					  true, &i);
+
+	if (d == NULL)
+		return -1;
+	d->src_addr = (uint64_t)src;
+	d->dst_addr = (uint64_t)dst;
+	d->crc_seed = DSA_CRC_SEED_RAW;
+	return i;
+}
+
+__attribute__((visibility("default")))
+int dto_batch_add_compare(dto_batch *b, const void *src1, const void *src2,
+			  size_t n, unsigned int flags)
+{
+	int i;
+	struct dsa_hw_desc *d = batch_add(b, DSA_OPCODE_COMPARE, src1, n, flags,
+					  false, &i);
+
+	if (d == NULL)
+		return -1;
+	d->src_addr = (uint64_t)src1;
+	d->src2_addr = (uint64_t)src2;
+	return i;
+}
+
+__attribute__((visibility("default")))
+int dto_batch_add_compval(dto_batch *b, const void *src, uint64_t pattern,
+			  size_t n, unsigned int flags)
+{
+	int i;
+	struct dsa_hw_desc *d = batch_add(b, DSA_OPCODE_COMPVAL, src, n, flags,
+					  false, &i);
+
+	if (d == NULL)
+		return -1;
+	d->src_addr = (uint64_t)src;
+	d->comp_pattern = pattern;
+	return i;
+}
+
+__attribute__((visibility("default")))
+int dto_batch_submit(dto_batch *b)
+{
+	struct dsa_hw_desc *desc;
+	struct dto_wq *wq;
+
+	if (atomic_load_explicit(&b->state, memory_order_relaxed) !=
+	    BATCH_BUILDING)
+		return DTO_ASYNC_FALLBACK;
+	if (b->count == 0) {
+		atomic_store_explicit(&b->state, BATCH_DONE,
+				      memory_order_release);
+		return DTO_ASYNC_SUBMITTED;
+	}
+	if (!dto_initialized || use_std_lib_calls)
+		return DTO_ASYNC_FALLBACK;
+	wq = get_wq((void *)b->hint);
+	if (unlikely(wq == NULL) ||
+	    (b->count > 1 && (uint32_t)b->count > wq->max_batch_size))
+		return DTO_ASYNC_FALLBACK;
+	for (int i = 0; i < b->count; i++) {
+		if (b->descs[i].xfer_size > wq->max_transfer_size)
+			return DTO_ASYNC_FALLBACK;
+	}
+
+	for (int i = 0; i < b->count; i++) {
+		struct dsa_hw_desc *d = &b->descs[i];
+
+		if (!(wq->dsa_gencap & GENCAP_CC_MEMORY))
+			d->flags &= ~IDXD_OP_FLAG_CC;
+		b->comps[i].status = 0;
+	}
+	if (b->count == 1) {
+		desc = &b->descs[0];
+	} else {
+		orig_memset(&b->desc, 0, sizeof(b->desc));
+		b->desc.opcode = DSA_OPCODE_BATCH;
+		b->desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+		b->desc.desc_list_addr = (uint64_t)b->descs;
+		b->desc.desc_count = (uint32_t)b->count;
+		b->desc.completion_addr = (uint64_t)&b->comp;
+		b->comp.status = 0;
+		desc = &b->desc;
+	}
+
+	if (async_submit(wq, desc, BATCH_SUBMIT_RETRIES) != DTO_ASYNC_SUBMITTED)
+		return DTO_ASYNC_FALLBACK;
+	atomic_store_explicit(&b->state, BATCH_SUBMITTED, memory_order_release);
+	return DTO_ASYNC_SUBMITTED;
+}
+
+/* Fill n bytes with the 8-byte pattern, as Memory Fill does. */
+static void cpu_fill(void *dst, uint64_t pattern, size_t n)
+{
+	uint8_t *p = dst;
+	size_t i = 0;
+
+	if (pattern == memfill_pattern((uint8_t)pattern)) {
+		orig_memset(dst, (uint8_t)pattern, n);
+		return;
+	}
+	for (; i + 8 <= n; i += 8)
+		*(unaligned_u64 *)(p + i) = pattern;
+	for (; i < n; i++)
+		p[i] = (uint8_t)(pattern >> (8 * (i & 7)));
+}
+
+/* Fill in a compare's result the way the device does: result 1 and the
+ * offset of the first difference, or result 0 with every byte compared.
+ * With src2 NULL, src1 is compared against the 8-byte pattern instead. */
+static void cpu_compare(struct dsa_completion_record *comp, const void *src1,
+			const void *src2, uint64_t pattern, size_t n)
+{
+	const uint8_t *a = src1, *b = src2;
+	size_t i = 0;
+
+	/* a word at a time up to the first differing word, then bytewise */
+	for (; i + 8 <= n; i += 8) {
+		uint64_t want = b ? *(const unaligned_u64 *)(b + i) : pattern;
+
+		if (*(const unaligned_u64 *)(a + i) != want)
+			break;
+	}
+	for (; i < n; i++) {
+		uint8_t want = b ? b[i] : (uint8_t)(pattern >> (8 * (i & 7)));
+
+		if (a[i] != want)
+			break;
+	}
+	comp->result = i < n;
+	comp->bytes_completed = (uint32_t)i;
+}
+
+/* A move the device stopped partway (a page fault without BOF) cannot be
+ * redone from the start when the buffers overlap: the device has already
+ * overwritten part of the source. bytes_completed counts from the end the
+ * copy started at, which bit 0 of result gives (1: descending). */
+static void cpu_redo_memmove(struct dsa_completion_record *comp, void *dst,
+			     const void *src, size_t n)
+{
+	size_t done = comp->bytes_completed;
+
+	if ((comp->status & DSA_COMP_STATUS_MASK) != DSA_COMP_PAGE_FAULT_NOBOF ||
+	    done >= n)
+		done = 0;
+	if (comp->result & 1)
+		orig_memmove(dst, src, n - done);
+	else
+		orig_memmove((uint8_t *)dst + done, (const uint8_t *)src + done,
+			     n - done);
+}
+
+/* Redo every operation the device did not complete on the CPU. Each status
+ * is left as the device wrote it, so dto_batch_status() still says who did
+ * the work; result, bytes_completed and crc_val are filled in as the device
+ * would have. */
+static void batch_repair(dto_batch *b)
+{
+	for (int i = 0; i < b->count; i++) {
+		const struct dsa_hw_desc *d = &b->descs[i];
+		struct dsa_completion_record *c = &b->comps[i];
+		void *dst = (void *)(uintptr_t)d->dst_addr;
+		const void *src = (const void *)(uintptr_t)d->src_addr;
+		size_t n = d->xfer_size;
+
+		if ((c->status & DSA_COMP_STATUS_MASK) == DSA_COMP_SUCCESS)
+			continue;
+		switch (d->opcode) {
+		case DSA_OPCODE_MEMMOVE:
+			cpu_redo_memmove(c, dst, src, n);
+			break;
+		case DSA_OPCODE_MEMFILL:
+			cpu_fill(dst, d->pattern, n);
+			break;
+		case DSA_OPCODE_DUALCAST:
+			orig_memcpy(dst, src, n);
+			orig_memcpy((void *)(uintptr_t)d->dest2, src, n);
+			break;
+		case DSA_OPCODE_COPY_CRC:
+			orig_memcpy(dst, src, n);
+			c->crc_val = cpu_crc32c(d->crc_seed, src, n);
+			break;
+		case DSA_OPCODE_CRCGEN:
+			c->crc_val = cpu_crc32c(d->crc_seed, src, n);
+			break;
+		case DSA_OPCODE_COMPARE:
+			cpu_compare(c, src, (const void *)(uintptr_t)d->src2_addr,
+				    0, n);
+			break;
+		case DSA_OPCODE_COMPVAL:
+			cpu_compare(c, src, NULL, d->comp_pattern, n);
+			break;
+		}
+	}
+}
+
+__attribute__((visibility("default")))
+int dto_batch_poll(dto_batch *b)
+{
+	int state = atomic_load_explicit(&b->state, memory_order_acquire);
+	uint8_t status;
+
+	if (state == BATCH_DONE)
+		return DTO_ASYNC_DONE;
+	if (state == BATCH_BUILDING)
+		return DTO_ASYNC_FAILED;
+	if (state == BATCH_REPAIRING)
+		return DTO_ASYNC_PENDING;
+
+	status = __atomic_load_n(batch_status(b), __ATOMIC_ACQUIRE);
+	if (status == 0)
+		return DTO_ASYNC_PENDING;
+	if ((status & DSA_COMP_STATUS_MASK) != DSA_COMP_SUCCESS) {
+		/* exactly one poller repairs; the others see PENDING meanwhile */
+		if (!atomic_compare_exchange_strong(&b->state, &state,
+						    BATCH_REPAIRING))
+			return state == BATCH_DONE ? DTO_ASYNC_DONE :
+						     DTO_ASYNC_PENDING;
+		async_log_failure(status, b->count == 1 ? b->descs[0].opcode :
+				  DSA_OPCODE_BATCH, b->count);
+		batch_repair(b);
+	}
+	atomic_store_explicit(&b->state, BATCH_DONE, memory_order_release);
+	return DTO_ASYNC_DONE;
+}
+
+__attribute__((visibility("default")))
+void dto_batch_wait(dto_batch *b)
+{
+	if (atomic_load_explicit(&b->state, memory_order_acquire) !=
+	    BATCH_SUBMITTED)
+		return;
+	dsa_wait_no_adjust(batch_status(b));
+	atomic_thread_fence(memory_order_acquire);
+}
+
+__attribute__((visibility("default")))
+int dto_batch_status(const dto_batch *b, int i)
+{
+	if (i < 0 || i >= b->count)
+		return 0;
+	return __atomic_load_n((const uint8_t *)&b->comps[i].status,
+			       __ATOMIC_ACQUIRE) & DSA_COMP_STATUS_MASK;
+}
+
+__attribute__((visibility("default")))
+int dto_batch_result(const dto_batch *b, int i)
+{
+	if (i < 0 || i >= b->count)
+		return 0;
+	return b->comps[i].result;
+}
+
+__attribute__((visibility("default")))
+uint32_t dto_batch_bytes_completed(const dto_batch *b, int i)
+{
+	if (i < 0 || i >= b->count)
+		return 0;
+	return b->comps[i].bytes_completed;
+}
+
+__attribute__((visibility("default")))
+uint32_t dto_batch_crc(const dto_batch *b, int i)
+{
+	if (i < 0 || i >= b->count)
+		return 0;
+	return DSA_CRC_VAL_TO_RAW(b->comps[i].crc_val);
+}
+
+__attribute__((visibility("default")))
+int dto_submit_batch_copy(dto_batch *b, void **dst, void **src,
+			  size_t *sizes, int count, unsigned int flags)
+{
+	if (count < 1 || count > b->cap)
+		return DTO_ASYNC_FALLBACK;
+	dto_batch_reset(b);
+	for (int i = 0; i < count; i++) {
+		if (dto_batch_add_memmove(b, dst[i], src[i], sizes[i],
+					  flags) < 0)
+			return DTO_ASYNC_FALLBACK;
+	}
+	return dto_batch_submit(b);
 }
