@@ -50,9 +50,12 @@ dto-4-dsa.conf:  An example json config file for configuring DSAs
 Following environment variables control the behavior of DTO library:
 	DTO_USESTDC_CALLS=0/1, 1 (uses std c memory functions only), 0 (uses DSA along with std c lib call; in case of DSA page fault - reverts to std c lib call). Default is 0.
         DTO_COLLECT_STATS=0/1, 1 (enables stats collection - #of operations, avg latency for each API, etc.>, 0 (disables stats collection).
-                                Should be enabled for debugging/profiling only, not for perf evaluation (enabling it slows down the workload). Default is 0.
-        DTO_STATS_FILE=<path> when DTO_COLLECT_STATS=1, redirect histogram output to the provided regular file instead of standard output.
-                                The file is truncated when DTO loads; failures fall back to standard output and emit an error.
+                                Adds about 40 ns per call (two clock reads), whatever the number of threads. Default is 0. See Statistics below.
+        DTO_STATS_FILE=<path> when DTO_COLLECT_STATS=1, write stats to the provided regular file instead of standard output. Each %p in
+                                the path is replaced by the process ID. Records are appended, not truncated: processes started from this one
+                                append to the same file unless the path has a %p. Failures fall back to standard output and emit an error.
+        DTO_STATS_FORMAT=text/json  text (default): the tables shown below; json: JSON Lines, one record per line (see Statistics).
+        DTO_STATS_INTERVAL_MS=N  when N > 0, also write what happened in every N ms, from a background thread. Default is 0.
 	DTO_WAIT_METHOD=<yield,busypoll,umwait,tpause> (specifies the method to use while waiting for DSA to complete operation, default is busypoll)
 	DTO_MIN_BYTES=xxxx (specifies minimum size of API call needed for DSA operation execution, default is 65536 bytes)
 	DTO_CPU_SIZE_FRACTION=0.xx (specifies fraction of job performed by CPU, in parallel to DSA). Default is 0.00
@@ -310,63 +313,72 @@ to the DSA device.
 
 	<CBENCH_DIR>/cachebench -json_test_config <json file> --progress_stats_file=dto.log --report_api_latency
 
-4. Sample histogram given below (generated using DTO_COLLECT_STATS=1)
+4. Sample stats output (DTO_COLLECT_STATS=1; see [Statistics](#statistics))
 	i. Numbers under columns set, cpy, mov, and cmp show number of API calls or per-API completion latency for memset, memcpy, memmove, and memcmp respectively.
 	ii. Numbers in bytes column show total bytes processed across all 4 API calls
 
 ------------------------------------------------------------------------------------------------------------------------------------------
 
-DTO Run Time: 22826 ms
+```
+DTO Run Time: 8 ms
 
 ******** Number of Memory Operations ********
-                     <*************** stdc calls    ***************> <*************** dsa (success) ***************> <*************** dsa (failed)  ***************> <***** failure reason *****>
-Byte Range        -- set      cpy      mov      cmp      bytes        set      cpy      mov      cmp      bytes        set      cpy      mov      cmp      bytes        Retries PFs    Others
-       0-4095     -- 24616626 12319310 7676731  244777209 4531255821  0        0        0        0        0            0        0        0        0        0            0      0      0
-    4096-8191     -- 3        290      14       0        1842507      0        0        0        0        0            0        0        0        0        0            0      0      0
-    8192-12287    -- 0        2        6        0        45579        64       176      2        0        2545968      0        2        6        0        25276        0      8      0
-   12288-16383    -- 1        1        0        0        20756        1        137      0        0        1965343      1        1        0        0        11172        0      2      0
-   16384-20479    -- 0        1        3        0        41974        0        126      2        0        2328434      0        1        3        0        24337        0      4      0
-   32768-36863    -- 0        0        0        0        0            0        67       2        0        2378165      0        0        0        0        0            0      0      0
-   53248-57343    -- 0        0        0        0        0            0        46       0        0        2545890      0        0        0        0        0            0      0      0
-   98304-102399   -- 0        0        0        0        0            0        13       0        0        1309627      0        0        0        0        0            0      0      0
-  106496-110591   -- 0        1        0        0        31637        0        8        0        0        869880       0        1        0        0        77586        0      1      0
-  118784-122879   -- 0        0        0        0        0            0        9        0        0        1083519      0        0        0        0        0            0      0      0
-  131072-135167   -- 0        0        2        0        175638       0        5        0        0        665475       0        0        2        0        86506        0      2      0
-  143360-147455   -- 0        0        0        0        0            0        1        0        0        143399       0        0        0        0        0            0      0      0
-  147456-151551   -- 0        0        0        0        0            0        1        0        0        148647       0        0        0        0        0            0      0      0
-  159744-163839   -- 0        0        0        0        0            0        6        0        0        970186       0        0        0        0        0            0      0      0
-  212992-217087   -- 0        0        11       0        1580248      0        4        2        0        1292252      0        0        11       0        779384       0      11     0
-  278528-282623   -- 0        0        0        0        0            0        1        0        0        279719       0        0        0        0        0            0      0      0
-  466944-471039   -- 0        0        0        0        0            0        1        0        0        467783       0        0        0        0        0            0      0      0
-  528384-532479   -- 0        0        0        0        0            0        1        0        0        529927       0        0        0        0        0            0      0      0
-  720896-724991   -- 0        0        0        0        0            1        0        0        0        720896       0        0        0        0        0            0      0      0
-  999424-1003519  -- 0        0        0        0        0            0        1        0        0        1002439      0        0        0        0        0            0      0      0
-   >=2093056      -- 0        1        0        0        1975911      0        0        0        0        0            0        1        0        0        973209       0      1      0
+                           <*************** stdc calls    ***************> <*************** dsa (success) ***************> <*************** dsa (failed)  ***************> <***** failure reason *****>
+Byte Range              -- set      cpy      mov      cmp      bytes        set      cpy      mov      cmp      bytes        set      cpy      mov      cmp      bytes        Retry  PFs    Others
+      65536-81919       -- 0        0        0        0        0            200      0        0        0        13926400     0        0        0        0        0            0      0      0
+      98304-114687      -- 0        0        200      0        19662200     0        0        0        0        0            0        0        0        0        0            0      0      0
+     131072-163839      -- 0        0        0        0        0            0        200      0        0        26239000     0        0        0        0        0            0      0      0
+     262144-327679      -- 0        0        0        0        0            0        0        0        200      52441600     0        0        0        0        0            0      0      0
 
 ******** Average Memory Operation Latency (us)  ********
-                     <******** stdc calls    ********> <******** dsa (success) ********> <******** dsa (failed)  ********> 
-Byte Range        -- set      cpy      mov      cmp      set      cpy      mov      cmp      set      cpy      mov      cmp
-       0-4095     -- 0.01     0.02     0.01     0.04     0        0        0        0        0        0        0        0
-    4096-8191     -- 0.07     0.42     0.47     0        0        0        0        0        0        0        0        0
-    8192-12287    -- 0        1.29     0.47     0        0.84     1.19     1.82     0        0        56.18    2.54     0
-   12288-16383    -- 2.90     3.34     0        0        7.49     1.26     0        0        2.07     1.93     0        0
-   16384-20479    -- 0        0.27     3.24     0        0        1.37     1.86     0        0        84.92    2.47     0
-   32768-36863    -- 0        0        0        0        0        1.87     2.91     0        0        0        0        0
-   53248-57343    -- 0        0        0        0        0        2.45     0        0        0        0        0        0
-   98304-102399   -- 0        0        0        0        0        3.76     0        0        0        0        0        0
-  106496-110591   -- 0        229.18   0        0        0        4.19     0        0        0        3.65     0        0
-  118784-122879   -- 0        0        0        0        0        5.18     0        0        0        0        0        0
-  131072-135167   -- 0        0        25.00    0        0        5.92     0        0        0        0        14.39    0
-  143360-147455   -- 0        0        0        0        0        5.11     0        0        0        0        0        0
-  147456-151551   -- 0        0        0        0        0        6.16     0        0        0        0        0        0
-  159744-163839   -- 0        0        0        0        0        7.65     0        0        0        0        0        0
-  212992-217087   -- 0        0        36.10    0        0        8.15     6.59     0        0        0        18.07    0
-  278528-282623   -- 0        0        0        0        0        15.47    0        0        0        0        0        0
-  466944-471039   -- 0        0        0        0        0        15.91    0        0        0        0        0        0
-  528384-532479   -- 0        0        0        0        0        18.65    0        0        0        0        0        0
-  720896-724991   -- 0        0        0        0        17.71    0        0        0        0        0        0        0
-  999424-1003519  -- 0        0        0        0        0        28.42    0        0        0        0        0        0
-   >=2093056      -- 0        422.15   0        0        0        0        0        0        0        272.87   0        0
+                           <******** stdc calls    ********> <******** dsa (success) ********> <******** dsa (failed)  ********>
+Byte Range              -- set      cpy      mov      cmp      set      cpy      mov      cmp      set      cpy      mov      cmp
+      65536-81919       -- 0        0        0        0        8.06     0        0        0        0        0        0        0
+      98304-114687      -- 0        0        4.18     0        0        0        0        0        0        0        0        0
+     131072-163839      -- 0        0        0        0        0        17.02    0        0        0        0        0        0
+     262144-327679      -- 0        0        0        0        0        0        0        34.50    0        0        0        0
+```
+
+## Statistics
+
+With `DTO_COLLECT_STATS=1`, DTO times and counts every memset, memcpy,
+memmove and memcmp it intercepts, by operation, by path (CPU, DSA, or DSA
+failed and finished on the CPU) and by size, and writes a summary when the
+process exits (or on Ctrl-C). Each thread counts on its own, so collection
+costs about 40 ns per call however many threads there are, and the counts
+are summed for output.
+
+The size histogram has a bucket for calls under 64 bytes, then four buckets
+per power of two up to 4 GiB (65536-81919, 81920-98303, ...), and one for
+anything larger. A call that DSA completed only partly (for example on a
+page fault) is counted once as `dsa (failed)` and once as a CPU call for the
+remainder.
+
+With `DTO_STATS_INTERVAL_MS=N`, a background thread also writes, every N ms,
+what happened since the previous record, so activity can be followed over
+time. The interval records add up to the summary's totals.
+
+With `DTO_STATS_FORMAT=json` the output is JSON Lines, one record per line:
+
+```
+{"type":"interval","pid":183654,"t_ms":14.333,"dt_ms":14.333,"ops":{"memcpy":{"dsa":{"calls":8,"bytes":1049560,"ns":96273}},"memmove":{"cpu":{"calls":8,"bytes":786488,"ns":31601}}},"failures":{"retry":0,"page_fault":0,"other":0}}
+{"type":"summary","pid":183654,"program":"prog","run_ms":23.395,
+ "config":{"stdc_only":0,"wait_method":"busypoll","min_bytes":65536,"cpu_size_fraction":0.00,"auto_adjust":1,"numa_aware":0,"wqs":1},
+ "totals":{"memcpy":{"dsa":{"calls":12,"bytes":1574340,"ns":138591}},...},
+ "failures":{"retry":0,"page_fault":0,"other":0},
+ "histogram":[{"min":131072,"max":163839,"ops":{"memcpy":{"dsa":{"calls":12,"bytes":1574340,"ns":138591}}},"failures":{...}},...]}
+```
+
+(The summary is a single line; it is wrapped here.) `ops` maps `memset`,
+`memcpy`, `memmove` and `memcmp` to the paths they took, `cpu`, `dsa` and
+`dsa_failed`, each with the number of calls, bytes and total nanoseconds;
+operations and paths with no calls are left out. `t_ms` and `run_ms` count
+from DTO's start, and `config` holds the settings at exit, including the
+auto-tuned `min_bytes` and `cpu_size_fraction`.
+
+Every process that loads DTO with stats enabled writes its own records,
+tagged with its `pid`. They share `DTO_STATS_FILE` (records are appended
+whole) unless the path contains `%p`, which gives each process its own file.
 
 ## Usage Notes
 
