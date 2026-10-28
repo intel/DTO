@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <poll.h>
 #include <string.h>
 #include <stdarg.h>
 #include <unistd.h>
@@ -318,6 +319,7 @@ static bool stats_file_per_pid;	/* DTO_STATS_FILE has a %p */
 /* DTO_STATS_INTERVAL_MS */
 static unsigned long stats_interval_ms;
 static atomic_uchar sampler_started;
+static bool stats_shutdown;	/* cleanup_dto ran: no new sampler */
 static struct dto_stats sampler_prev;	/* totals at the previous record */
 static uint64_t sampler_prev_ns;
 
@@ -831,7 +833,8 @@ static struct dto_thread_stats *stats_thread_register(void)
 	pthread_setspecific(stats_key, ts);
 	thr_stats = ts;
 
-	if (stats_interval_ms && !atomic_load_explicit(&sampler_started,
+	if (stats_interval_ms && !stats_shutdown &&
+	    !atomic_load_explicit(&sampler_started,
 						       memory_order_acquire))
 		stats_start_sampler();
 	thr_stats_off = false;
@@ -872,7 +875,10 @@ static void update_stats(int op, size_t n, bool overlapping, size_t bytes_comple
  * possible: to DTO_STATS_FILE (opened O_APPEND, so records from several
  * processes sharing it stay whole), else DTO_LOG_FILE, else stdout. */
 
-static char stats_out[1 << 16];
+/* Holds a whole record, so a summary (up to ~1 KB for each of the 106
+ * histogram buckets in JSON) goes out in one write() and records from
+ * several processes sharing an O_APPEND file stay whole. */
+static char stats_out[1 << 18];
 static size_t stats_out_len;
 
 static void stats_flush(void)
@@ -883,6 +889,14 @@ static void stats_flush(void)
 	while (off < stats_out_len) {
 		ssize_t r = write(fd, stats_out + off, stats_out_len - off);
 
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r < 0 && errno == EAGAIN) {
+			struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+
+			if (poll(&pfd, 1, -1) > 0 || errno == EINTR)
+				continue;
+		}
 		if (r <= 0)
 			break;
 		off += r;
@@ -1309,10 +1323,12 @@ static void stats_fork_prepare(void)
 {
 	pthread_mutex_lock(&stats_out_lock);
 	pthread_mutex_lock(&stats_lock);
+	pthread_mutex_lock(&sampler_lock);
 }
 
 static void stats_fork_parent(void)
 {
+	pthread_mutex_unlock(&sampler_lock);
 	pthread_mutex_unlock(&stats_lock);
 	pthread_mutex_unlock(&stats_out_lock);
 }
@@ -1323,6 +1339,7 @@ static void stats_fork_child(void)
 {
 	struct dto_thread_stats *t = stats_threads, *next;
 
+	pthread_mutex_unlock(&sampler_lock);
 	pthread_mutex_unlock(&stats_lock);
 	pthread_mutex_unlock(&stats_out_lock);
 	for (; t; t = next) {
@@ -1333,9 +1350,11 @@ static void stats_fork_child(void)
 	orig_memset(&stats_retired, 0, sizeof(stats_retired));
 	orig_memset(&sampler_prev, 0, sizeof(sampler_prev));
 	sampler_prev_ns = 0;
-	pthread_setspecific(stats_key, NULL);
+	if (stats_key_created)
+		pthread_setspecific(stats_key, NULL);
 	thr_stats = NULL;
 	thr_stats_off = false;
+	sampler_stop = false;
 	atomic_store(&sampler_started, 0);
 	stats_out_len = 0;
 	/* with %p the child writes a file of its own: init_dto opens it */
@@ -2024,10 +2043,16 @@ static int init_dto(void)
 
 			env_str = getenv("DTO_STATS_INTERVAL_MS");
 			if (env_str != NULL) {
+				char *end;
+
 				errno = 0;
-				stats_interval_ms = strtoul(env_str, NULL, 10);
-				if (errno)
+				stats_interval_ms = strtoul(env_str, &end, 10);
+				/* a day: beyond that it is a typo, and the timespec math stays exact */
+				if (errno || end == env_str || *end || *env_str == '-' ||
+				    stats_interval_ms > 86400000UL) {
+					LOG_ERROR("Invalid DTO_STATS_INTERVAL_MS '%s', no interval records\n", env_str);
 					stats_interval_ms = 0;
+				}
 			}
 
 			/* A forked child keeps the parent's (O_APPEND) file,
@@ -2216,6 +2241,7 @@ static void cleanup_dto(void)
 	}
 #ifdef DTO_STATS_SUPPORT
 	if (collect_stats) {
+		stats_shutdown = true;
 		stats_stop_sampler();
 		print_stats();
 	}
