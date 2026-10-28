@@ -203,7 +203,8 @@ Stats run
 
 \--repeat=_N_
 :   With `--stats-run`, run each way _N_ times, alternating; the report takes
-    the median times.  Default: 1.
+    the median wall time, and the CPU and mem* times of the run with the
+    median CPU time.  Default: 1.
 
 \--perf[=_PERF_]
 :   With `--stats-run`, also run each way once more under

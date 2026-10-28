@@ -109,7 +109,11 @@ def load_dir(d):
         if r.get("exit_status", 0) or "signal" in r:
             how = (f"was killed by signal {r['signal']}" if "signal" in r
                    else f"exited with status {r['exit_status']}")
-            note(f"run {r['name']} {how}; later runs did not happen")
+            if r.get("profiled"):
+                note(f"profiled run {r['name']} {how}; the timed runs are "
+                     "reported without a profile")
+            else:
+                note(f"run {r['name']} {how}; later runs did not happen")
         path = os.path.join(d, r["stats"])
         r["summaries"] = [s for s in load_jsonl(path) if s.get("type") == "summary"]
         if not r["summaries"] and r.get("exit_status") == 0:
@@ -134,15 +138,20 @@ def mode_summary(runs):
     timed = [r for r in runs if r.get("exit_status") == 0 and r["summaries"]]
     if not timed:
         return None
+    # The CPU time, the mem* time and the histogram all come from one run,
+    # the one with the median CPU time, so that f and "outside mem* calls"
+    # compare like with like: a mean mem* time against a median CPU time
+    # lets one preempted run push f past 100%. The wall time is the median.
+    by_cpu = sorted(timed, key=lambda r: r["user_s"] + r["sys_s"])
+    rep = by_cpu[(len(by_cpu) - 1) // 2]
     st = RunStats()
-    for r in timed:
-        st.add_run(r["summaries"], 1.0 / len(timed))
+    st.add_run(rep["summaries"], 1.0)
     walls = [r["wall_s"] for r in timed]
     return {
         "runs": len(timed),
         "wall_s": statistics.median(walls),
         "wall_range": (min(walls), max(walls)),
-        "cpu_s": statistics.median(r["user_s"] + r["sys_s"] for r in timed),
+        "cpu_s": rep["user_s"] + rep["sys_s"],
         "mem_s": st.total("ns") / 1e9,
         "bytes": st.total("bytes"),
         "stats": st,

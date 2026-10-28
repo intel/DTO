@@ -201,7 +201,8 @@ exported in your shell.
 with DSA, collecting DTO's JSON stats (see [Statistics](#statistics)) from each
 run into a directory, and `dto-stats-report` (installed with `dtoctl`) compares
 them. With `--repeat=N` each way runs N times, alternating, and the report uses
-the medians; `--perf` adds one more run each way under `perf record`.
+the median wall time and, for the CPU and mem* times, the run with the median
+CPU time; `--perf` adds one more run each way under `perf record`.
 
 ```bash
 sudo taskset -c 2 dtoctl -w busypoll --no-auto-adjust -c 0 --stats-run=app-stats --repeat=3 --perf ./app

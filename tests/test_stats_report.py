@@ -93,6 +93,11 @@ def hist(cpy, mset):
 cpu_cpy = ops(memcpy_cpu=(1000, B_CPY, 4e9))
 cpu_set = ops(memset_cpu=(1000, B_SET, 1e9))
 cpu_rec = summary(1, {**cpu_cpy, **cpu_set}, hist(cpu_cpy, cpu_set))
+# the same work in a run whose threads were preempted inside the calls:
+# three times the mem* time, a little more CPU time
+slow_cpy = ops(memcpy_cpu=(1000, B_CPY, 12e9))
+slow_set = ops(memset_cpu=(1000, B_SET, 3e9))
+slow_rec = summary(1, {**slow_cpy, **slow_set}, hist(slow_cpy, slow_set))
 # with DSA: memcpy 4x faster; memset 90% of bytes on DSA, 0.3 s in all.
 # Two processes, each reporting part of the work.
 dsa_cpy = ops(memcpy_dsa=(1000, B_CPY, 1e9))
@@ -105,7 +110,7 @@ dsa_recs = [summary(2, dsa_cpy, hist(dsa_cpy, {}), page_faults=5),
 d = write_run_dir([
     ("cpu-1", "cpu", 10.0, 10.0, [cpu_rec], 0),
     ("dsa-1", "dsa", 6.0, 6.0, dsa_recs, 0),
-    ("cpu-2", "cpu", 30.0, 10.0, [cpu_rec], 0),     # an outlier
+    ("cpu-2", "cpu", 30.0, 10.5, [slow_rec], 0),    # an outlier
     ("dsa-2", "dsa", 7.0, 6.2, dsa_recs, 0),
     ("cpu-3", "cpu", 11.0, 10.0, [cpu_rec], 0),
     ("dsa-3", "dsa", 6.5, 6.1, dsa_recs, 0),
@@ -123,6 +128,10 @@ if r:
     check("measured speedup uses median wall times", close(r["measured"]["wall"], 11 / 6.5),
           r["measured"])
     check("median CPU time", close(r["modes"]["dsa"]["cpu_s"], 6.1), r["modes"]["dsa"])
+    check("mem* time is the median-CPU run's, not a mean over runs",
+          close(r["modes"]["cpu"]["mem_s"], 5.0), r["modes"]["cpu"]["mem_s"])
+    check("time outside mem* calls comes from that same run",
+          close(r["outside_mem_s"]["cpu"], 5.0), r["outside_mem_s"])
     check("processes of a run are summed", close(r["modes"]["dsa"]["mem_s"], 1.3),
           r["modes"]["dsa"]["mem_s"])
     o = r["ops"]

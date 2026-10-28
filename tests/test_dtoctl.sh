@@ -115,7 +115,7 @@ has "another libdto in LD_PRELOAD is dropped" "dropping '$TMP/old/libdto.so.1'"
 for bad in "-w bogus" "-b 64Q" "-b abc" "-b -1" "-c 1.5" "-c nan" "-n 3" \
            "--log-level x" "--umwait-delay 0" "--overlapping-memmove=gpu" \
            "--stats-format xml" "--stats-interval 0" "--repeat 2" "--perf" \
-           "--stats-run --stdc-only" "--stats-run --stats-file=x" "--stats-run=a%b" \
+           "--stats-run --stdc-only" "--stats-run --stats-file=x" "--stats-run=a%pb" \
            "--stats-run --repeat 0"; do
     run "$DTOCTL" -l "$LIB" $bad true
     status "rejects $bad" 64
@@ -165,7 +165,11 @@ status "--stats-run needs a program, even with --dry-run" 64
 # dash leaves with _exit(), skipping DTO's summary, so end in a program that exits
 run "$DTOCTL" -l "$LIB" --stats-run="$TMP/run" --repeat 2 \
     sh -c 'echo "env $DTO_USESTDC_CALLS ${DTO_STATS_FILE##*/} $DTO_STATS_FORMAT"; exec true'
-status "stats run succeeds" 0
+if command -v python3 >/dev/null; then
+    status "stats run succeeds" 0
+else
+    status "stats run succeeds (the report needs python3)" 127
+fi
 has "CPU-only runs set DTO_USESTDC_CALLS=1" "^env 1 cpu-2.jsonl json\$"
 has "DSA runs set DTO_USESTDC_CALLS=0" "^env 0 dsa-2.jsonl json\$"
 if [ "$(grep -c '"type":"run".*"exit_status":0' "$TMP/run/runs.jsonl")" -eq 4 ] &&

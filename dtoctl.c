@@ -445,8 +445,8 @@ static error_t parse_option(int key, char *arg, struct argp_state *state)
 		opts->stats_run = true;
 		opts->stats_dir = arg ? check_path(state, "stats-run", arg) : NULL;
 		/* libdto would expand a %p in the stats file names */
-		if (arg && strchr(arg, '%'))
-			argp_error(state, "--stats-run directory '%s' cannot contain '%%'",
+		if (arg && strstr(arg, "%p"))
+			argp_error(state, "--stats-run directory '%s' cannot contain '%%p'",
 				   arg);
 		break;
 	case OPT_REPEAT:
@@ -805,10 +805,38 @@ static const char *const perf_record[] = {
 /* LD_PRELOAD as dtoctl found it, for perf and dto-stats-report */
 static char *orig_preload;
 
+/* The caller's LD_PRELOAD without libdto, for perf and the report: they
+ * must not be measured, and setup_preload may have kept a libdto the
+ * caller had exported. */
 static void restore_preload(void)
 {
-	if (orig_preload ? setenv("LD_PRELOAD", orig_preload, 1) :
-			   unsetenv("LD_PRELOAD")) {
+	char *copy = NULL, *preload = NULL, *entry, *save;
+	int err;
+
+	if (orig_preload == NULL) {
+		err = unsetenv("LD_PRELOAD");
+	} else {
+		copy = strdup(orig_preload);
+		preload = malloc(strlen(orig_preload) + 1);
+		if (copy == NULL || preload == NULL) {
+			perror("dtoctl: cannot build LD_PRELOAD");
+			exit(EXIT_DTOCTL_FAILURE);
+		}
+		*preload = '\0';
+		for (entry = strtok_r(copy, ": ", &save); entry;
+		     entry = strtok_r(NULL, ": ", &save)) {
+			if (is_libdto(entry))
+				continue;
+			if (*preload)
+				strcat(preload, ":");
+			strcat(preload, entry);
+		}
+		err = *preload ? setenv("LD_PRELOAD", preload, 1) :
+				 unsetenv("LD_PRELOAD");
+	}
+	free(copy);
+	free(preload);
+	if (err) {
 		perror("dtoctl: LD_PRELOAD");
 		exit(EXIT_DTOCTL_FAILURE);
 	}
@@ -970,6 +998,16 @@ static char *make_stats_dir(const char *dir)
 	char *path;
 	DIR *d;
 
+	/* libdto expands %p in the stats file names; the working directory
+	 * may bring one in, so check the full path before creating anything */
+	if (dir[0] != '/' && (path = getcwd(NULL, 0)) != NULL) {
+		if (strstr(path, "%p")) {
+			fprintf(stderr, "dtoctl: stats directory '%s/%s' cannot contain '%%p'\n",
+				path, dir);
+			exit(EXIT_DTOCTL_FAILURE);
+		}
+		free(path);
+	}
 	if (mkdir(dir, 0777) && errno != EEXIST) {
 		fprintf(stderr, "dtoctl: cannot create '%s': %s\n", dir, strerror(errno));
 		exit(EXIT_DTOCTL_FAILURE);
@@ -994,8 +1032,8 @@ static char *make_stats_dir(const char *dir)
 		fprintf(stderr, "dtoctl: '%s': %s\n", dir, strerror(errno));
 		exit(EXIT_DTOCTL_FAILURE);
 	}
-	if (strchr(path, '%')) {
-		fprintf(stderr, "dtoctl: stats directory '%s' cannot contain '%%'\n", path);
+	if (strstr(path, "%p")) {
+		fprintf(stderr, "dtoctl: stats directory '%s' cannot contain '%%p'\n", path);
 		exit(EXIT_DTOCTL_FAILURE);
 	}
 	return path;
@@ -1085,13 +1123,13 @@ static int stats_run_one(FILE *runs, const char *dir, const struct run_mode *mod
 		ret = WEXITSTATUS(status);
 		fprintf(runs, "\"exit_status\":%d}\n", ret);
 		if (ret)
-			fprintf(stderr, "dtoctl: run %s exited with status %d; stopping\n",
-				name, ret);
+			fprintf(stderr, "dtoctl: run %s exited with status %d%s\n",
+				name, ret, perf_argv ? "" : "; stopping");
 	} else {
 		ret = 128 + WTERMSIG(status);
 		fprintf(runs, "\"signal\":%d}\n", WTERMSIG(status));
-		fprintf(stderr, "dtoctl: run %s was killed by signal %d; stopping\n",
-			name, WTERMSIG(status));
+		fprintf(stderr, "dtoctl: run %s was killed by signal %d%s\n",
+			name, WTERMSIG(status), perf_argv ? "" : "; stopping");
 	}
 	fflush(runs);
 	free(stats);
@@ -1195,10 +1233,13 @@ static int stats_run(struct opts *opts, const char *lib, const char *source,
 				return ret;
 		}
 	}
+	/* the profiles are extras: the timed runs are reported without them */
 	for (m = 0; perf_argv && m < NR_RUN_MODES; m++) {
 		ret = stats_run_one(runs, dir, &run_modes[m], 0, perf_argv, argv);
-		if (ret)
-			return ret;
+		if (ret) {
+			fprintf(stderr, "dtoctl: reporting the timed runs without a profile\n");
+			break;
+		}
 	}
 	fclose(runs);
 	fflush(stdout);
