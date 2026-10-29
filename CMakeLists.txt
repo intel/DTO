@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.5...3.31)
-project(DTO VERSION 1.0 LANGUAGES C)
+project(DTO VERSION 1.2 LANGUAGES C)
 
 # DTO may be built on its own or as part of another project (add_subdirectory
 # or FetchContent). As a subproject only the library is built by default, and
