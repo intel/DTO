@@ -87,6 +87,9 @@ struct dto_wq {
 	int wq_size;
 	uint32_t max_transfer_size;
 	uint32_t max_batch_size;
+	/* the work queue's block_on_fault attribute: whether descriptors may
+	 * carry IDXD_OP_FLAG_BOF (a queue without it rejects them) */
+	bool block_on_fault;
 	int wq_fd;
 	void *wq_portal;
 	bool wq_mmapped;
@@ -1015,6 +1018,12 @@ static int dsa_init_from_wq_list(char *wq_list)
 			goto fail_wq;
 		}
 
+		/* Not fatal when the attribute cannot be read: assume the
+		 * queue has no block-on-fault and never set the flag. */
+		wqs[num_wqs].block_on_fault =
+			dto_get_param_ullong(dir_fd, "block_on_fault", &rc) == 1 && !rc;
+		rc = 0;
+
 		dto_get_param_string(dir_fd, "mode", wq_mode);
 
 		if (wq_mode[0] == '\0') {
@@ -1179,6 +1188,7 @@ static int dsa_init_from_accfg(void)
 			wqs[num_wqs].wq_size = accfg_wq_get_size(wq);
 			wqs[num_wqs].max_transfer_size = accfg_wq_get_max_transfer_size(wq);
 			wqs[num_wqs].max_batch_size = accfg_wq_get_max_batch_size(wq);
+			wqs[num_wqs].block_on_fault = accfg_wq_get_block_on_fault(wq) > 0;
 
 			wqs[num_wqs].acc_wq = wq;
 			wqs[num_wqs].dsa_gencap = accfg_device_get_gen_cap(device);
@@ -1612,8 +1622,9 @@ static int init_dto(void)
 				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
 				cpu_size_fraction_float, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc);
 			for (int i = 0; i < num_wqs; i++)
-				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx\n", i,
-					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap);
+				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx, block_on_fault: %d\n", i,
+					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap,
+					wqs[i].block_on_fault);
 		}
 		dto_initialized = 1;
 
@@ -2285,10 +2296,11 @@ static __always_inline uint32_t async_desc_flags(const struct dto_wq *wq,
 {
 	uint32_t f = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
 
-	/* Passed as given: a work queue configured without block-on-fault
-	 * fails the descriptor with DSA_COMP_INVALID_FLAGS, and without the
-	 * flag a page fault stops the operation partway (see dto.h). */
-	if (flags & DTO_SUBMIT_BOF)
+	/* BOF only when the work queue allows it: a queue configured without
+	 * block-on-fault fails any descriptor carrying the flag with
+	 * DSA_COMP_INVALID_FLAGS, so there the flag is dropped and a page
+	 * fault stops the operation partway instead (see dto.h). */
+	if ((flags & DTO_SUBMIT_BOF) && wq->block_on_fault)
 		f |= IDXD_OP_FLAG_BOF;
 	/* CC is only legal for operations with a destination; CRC Generation
 	 * would be failed by the device with DSA_COMP_INVALID_FLAGS. */
@@ -2697,9 +2709,9 @@ int dto_batch_count(const dto_batch *b)
 }
 
 /* Descriptor for the next operation, or NULL (with *index unset) when the
- * batch is full or submitted or n is out of range. BOF is set as requested;
- * CC is recorded as requested and settled at submit, once the work queue
- * (and so the device's cache-control support) is known. */
+ * batch is full or submitted or n is out of range. BOF and CC are recorded as
+ * requested and settled at submit, once the work queue (and so its
+ * block-on-fault setting and the device's cache-control support) is known. */
 static struct dsa_hw_desc *batch_add(dto_batch *b, uint32_t opcode,
 				     const void *hint, size_t n,
 				     unsigned int flags, bool has_dest,
@@ -2869,6 +2881,8 @@ int dto_batch_submit(dto_batch *b)
 
 		if (!(wq->dsa_gencap & GENCAP_CC_MEMORY))
 			d->flags &= ~IDXD_OP_FLAG_CC;
+		if (!wq->block_on_fault)
+			d->flags &= ~IDXD_OP_FLAG_BOF;
 		b->comps[i].status = 0;
 	}
 	if (b->count == 1) {

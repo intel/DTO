@@ -128,10 +128,11 @@ could not finish, so once it returns `DTO_ASYNC_DONE` every result is valid.
 
 Explicit submits are not subject to `DTO_MIN_BYTES`: the caller decides what to
 offload. `DTO_SUBMIT_BOF` makes the device wait for page faults to be
-resolved; it requires a work queue configured with block-on-fault
-(`accel-config config-wq --block-on-fault=1`), and on one without it the
-device rejects the operation. Without the flag a page fault stops the
-operation partway, on any work queue. `dto_async_crc_val` and `dto_batch_crc`
+resolved when the work queue is configured with block-on-fault
+(`accel-config config-wq --block-on-fault=1`); on a queue without it the flag
+is dropped, since the device would reject it. Without the flag in effect a
+page fault stops the operation partway (`DTO_ASYNC_FAILED`, status `0x03`), so
+callers handle that case either way. `dto_async_crc_val` and `dto_batch_crc`
 return the raw CRC32C (the SSE4.2 `crc32` instruction applied from 0, no final
 inversion); the seeded `*_crc32c` calls return standard CRC32C and chain across
 buffers. See `dto.h` for the full contract.

@@ -77,7 +77,9 @@ sudo DTO_TEST_EXPECT_DSA=1 ./dto-test-functional-explicit
 ```
 
 `test_async_bof` checks the block-on-fault behavior against whichever setting
-the work queue has (it reports which), so run the suite once with
+the work queue has (it reports which): with `block_on_fault` enabled a
+`DTO_SUBMIT_BOF` copy into untouched pages completes, without it DTO drops the
+flag and the copy stops at the first untouched page. Run the suite once with
 `block_on_fault` enabled and once without to cover both. It assumes all work
 queues DTO uses share the same setting.
 
