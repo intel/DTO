@@ -874,42 +874,39 @@ static int test_async_transl_fetch(void)
 	return 0;
 }
 
-/* DTO_SUBMIT_BOF is passed to the device as given (dto.h). Learn whether the
- * work queue has block-on-fault from a BOF submit on faulted-in memory, then
- * copy into a destination whose first pages are touched and the rest not:
+/* DTO_SUBMIT_BOF is honored only on a work queue with block-on-fault; on one
+ * without it DTO drops the flag rather than let the device reject the
+ * descriptor (dto.h). Copy into a destination whose first pages are touched
+ * and the rest not:
  *   BOF set, WQ with block-on-fault:    the device waits; the copy completes
- *   BOF set, WQ without block-on-fault: rejected, status 0x11 (invalid flags)
+ *   BOF set, WQ without block-on-fault: flag dropped: stops at the first
+ *                                       untouched page, status 0x03
  *   BOF not set, any WQ:                stops at the first untouched page,
  *                                       status 0x03, the touched part done
+ * Whether the work queue has block-on-fault is learned from that first BOF
+ * copy; a BOF submit is never rejected with 0x11 (invalid flags) any more.
  * Assumes every work queue DTO uses has the same block-on-fault setting. */
 static int test_async_bof(void)
 {
 	const size_t page = 4096, n = 16 * page, warm = 4 * page;
-	uint8_t *src = malloc(n), *hot = malloc(n);
+	uint8_t *src = malloc(n), *hot = malloc(n), *cold;
 	dto_batch *b = dto_batch_create(2);
 	dto_async_op op;
-	int rc, wq_bof;
+	int rc, wq_bof = -1;
 
 	ASSERT_TRUE(src && hot && b);
 	fill_pattern(src, n);
 	clear_buf(hot, n);
 
+	/* On faulted-in memory a BOF submit completes on any work queue. */
 	rc = dto_submit_memcpy(&op, hot, src, n, DTO_SUBMIT_BOF);
 	CHECK_SUBMIT(rc);
 	if (rc != DTO_ASYNC_SUBMITTED)
 		return 0;
-	rc = finish(&op);
-	if (rc == DTO_ASYNC_DONE) {
-		wq_bof = 1;
-		ASSERT_TRUE(verify_equal(hot, src, n));
-	} else {
-		ASSERT_EQ(rc, DTO_ASYNC_FAILED);
-		ASSERT_EQ(dto_async_status(&op), 0x11);
-		wq_bof = 0;
-	}
-	printf("    (work queue block-on-fault: %s)\n", wq_bof ? "enabled" : "disabled");
+	ASSERT_EQ(finish(&op), DTO_ASYNC_DONE);
+	ASSERT_TRUE(verify_equal(hot, src, n));
 
-	for (int bof = 0; bof < 2; bof++) {
+	for (int bof = 1; bof >= 0; bof--) {
 		uint8_t *dst = mmap(NULL, n, PROT_READ | PROT_WRITE,
 				    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
@@ -919,13 +916,15 @@ static int test_async_bof(void)
 		CHECK_SUBMIT(rc);
 		if (rc == DTO_ASYNC_SUBMITTED) {
 			rc = finish(&op);
+			if (bof) {
+				wq_bof = rc == DTO_ASYNC_DONE;
+				printf("    (work queue block-on-fault: %s)\n",
+				       wq_bof ? "enabled" : "disabled");
+			}
 			if (bof && wq_bof) {
-				ASSERT_EQ(rc, DTO_ASYNC_DONE);
 				ASSERT_TRUE(verify_equal(dst, src, n));
-			} else if (bof) {
-				ASSERT_EQ(rc, DTO_ASYNC_FAILED);
-				ASSERT_EQ(dto_async_status(&op), 0x11);
 			} else {
+				/* no BOF in effect: partial, never 0x11 */
 				ASSERT_EQ(rc, DTO_ASYNC_FAILED);
 				ASSERT_EQ(dto_async_status(&op), 0x03);
 				ASSERT_EQ(dto_async_bytes_completed(&op), warm);
@@ -935,18 +934,26 @@ static int test_async_bof(void)
 		munmap(dst, n);
 	}
 
-	/* the same per batch operation; dto_batch_poll redoes the rejected ones */
+	/* The same per batch operation: a BOF member into untouched pages
+	 * completes on a block-on-fault queue and is otherwise stopped and
+	 * redone by dto_batch_poll; the member on hot memory always completes. */
+	cold = mmap(NULL, n / 2, PROT_READ | PROT_WRITE,
+		    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	ASSERT_TRUE(cold != MAP_FAILED);
 	clear_buf(hot, n);
-	ASSERT_EQ(dto_batch_add_memmove(b, hot, src, n / 2, DTO_SUBMIT_BOF), 0);
-	ASSERT_EQ(dto_batch_add_memmove(b, hot + n / 2, src + n / 2, n / 2, 0), 1);
+	ASSERT_EQ(dto_batch_add_memmove(b, cold, src, n / 2, DTO_SUBMIT_BOF), 0);
+	ASSERT_EQ(dto_batch_add_memmove(b, hot, src + n / 2, n / 2, DTO_SUBMIT_BOF), 1);
 	rc = dto_batch_submit(b);
 	CHECK_SUBMIT(rc);
 	if (rc == DTO_ASYNC_SUBMITTED) {
 		ASSERT_EQ(ASYNC_WAIT(dto_batch_poll(b)), DTO_ASYNC_DONE);
-		ASSERT_EQ(dto_batch_status(b, 0), wq_bof ? 1 : 0x11);
+		if (wq_bof >= 0)
+			ASSERT_EQ(dto_batch_status(b, 0), wq_bof ? 1 : 0x03);
 		ASSERT_EQ(dto_batch_status(b, 1), 1);
-		ASSERT_TRUE(verify_equal(hot, src, n));
+		ASSERT_TRUE(verify_equal(cold, src, n / 2));
+		ASSERT_TRUE(verify_equal(hot, src + n / 2, n / 2));
 	}
+	munmap(cold, n / 2);
 	dto_batch_destroy(b);
 	free(src);
 	free(hot);
