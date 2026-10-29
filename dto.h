@@ -58,19 +58,19 @@
  *
  * DTO_SUBMIT_BOF makes the device block on a page fault until the kernel has
  * resolved it, so the operation completes even if its buffers are not
- * faulted in. It is passed to the device as given, and the work queue must
- * be configured with block-on-fault ("accel-config config-wq
- * --block-on-fault=1"):
+ * faulted in. The device only accepts it on a work queue configured with
+ * block-on-fault ("accel-config config-wq --block-on-fault=1"); on a queue
+ * without it the flag is dropped, so the submission is still accepted but a
+ * page fault stops the operation partway, as if the flag had not been set:
  *
  *   WQ block-on-fault  DTO_SUBMIT_BOF  page fault ->
  *   enabled            set             the device waits; the op completes
- *   disabled           set             (always) DTO_ASYNC_FAILED, status 0x11
- *                                      (invalid flags): the device rejects it
- *   either             not set         DTO_ASYNC_FAILED, status 0x03: partial
- *                                      completion, see above
+ *   disabled           set             DTO_ASYNC_FAILED, status 0x03: partial
+ *   either             not set         completion, see above
  *
- * The same applies to each operation of a batch, which dto_batch_poll then
- * redoes on the CPU.
+ * The flag is thus "block on faults when the work queue allows it", and the
+ * caller must handle a partial completion either way. The same applies to
+ * each operation of a batch, which dto_batch_poll then redoes on the CPU.
  *
  * CRC values: dto_async_crc_val() and dto_batch_crc() return the raw CRC32C
  * of the data -- the SSE4.2 crc32 instruction applied from 0, with no final
