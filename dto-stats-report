@@ -1,0 +1,685 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Summarize a "dtoctl --stats-run": how much faster the program ran with DSA
+than CPU-only, and how that compares with Amdahl's law, using the time the
+CPU-only run spent in mem* calls and how much faster those calls were with
+DSA. With a perf profile of each run, also shows where the CPU time went:
+copies, memset, memcmp, CRC, kernel copies, DTO itself.
+
+usage: dto-stats-report [--json] [--perf PERF] [--top N] DIR
+"""
+
+import argparse
+import bisect
+import ctypes
+import json
+import os
+import re
+import statistics
+import struct
+import subprocess
+import sys
+
+OPS = ("memcpy", "memmove", "memset", "memcmp")
+PATHS = ("cpu", "dsa", "dsa_failed")
+FAILS = ("retry", "page_fault", "other")
+FIELDS = ("calls", "bytes", "ns")
+MODES = ("cpu", "dsa")
+
+notes = []
+
+
+def note(msg):
+    notes.append(msg)
+
+
+# ---- loading ---------------------------------------------------------------
+
+def load_jsonl(path):
+    recs = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for n, line in enumerate(f, 1):
+                if not line.strip():
+                    continue
+                try:
+                    recs.append(json.loads(line))
+                except json.JSONDecodeError:
+                    note(f"{os.path.basename(path)} line {n} is not valid JSON "
+                         "(cut short?); skipped")
+    except FileNotFoundError:
+        pass
+    except PermissionError:
+        # DTO writes stats files readable by their owner only
+        sys.exit(f"dto-stats-report: cannot read {path}: permission denied; the "
+                 "files belong to the user that ran dtoctl (run this with sudo?)")
+    return recs
+
+
+def zero_ops():
+    return {op: {p: dict.fromkeys(FIELDS, 0) for p in PATHS} for op in OPS}
+
+
+def add_ops(acc, ops, scale=1.0):
+    for op, paths in ops.items():
+        if op not in acc:
+            continue
+        for p, v in paths.items():
+            if p in acc[op]:
+                for k in FIELDS:
+                    acc[op][p][k] += v.get(k, 0) * scale
+
+
+class RunStats:
+    """DTO's stats for one or more runs of one mode, summed over every
+    process each run started, averaged over the runs."""
+
+    def __init__(self):
+        self.ops = zero_ops()
+        self.fails = dict.fromkeys(FAILS, 0)
+        self.hist = {}          # (min, max) -> ops
+        self.configs = []
+        self.processes = 0
+
+    def add_run(self, summaries, scale):
+        for s in summaries:
+            add_ops(self.ops, s.get("totals", {}), scale)
+            for k in FAILS:
+                self.fails[k] += s.get("failures", {}).get(k, 0) * scale
+            for b in s.get("histogram", []):
+                key = (b["min"], b.get("max"))
+                add_ops(self.hist.setdefault(key, zero_ops()), b.get("ops", {}), scale)
+            self.configs.append(s.get("config", {}))
+            self.processes += scale
+
+    def op_total(self, op, field, paths=PATHS):
+        return sum(self.ops[op][p][field] for p in paths)
+
+    def total(self, field, paths=PATHS):
+        return sum(self.op_total(op, field, paths) for op in OPS)
+
+
+def load_dir(d):
+    recs = load_jsonl(os.path.join(d, "runs.jsonl"))
+    if not recs or recs[0].get("type") != "stats_run":
+        sys.exit(f"dto-stats-report: {d} has no runs.jsonl from dtoctl --stats-run")
+    header, runs = recs[0], [r for r in recs[1:] if r.get("type") == "run"]
+    no_file, no_summary = [], []
+    for r in runs:
+        if r.get("exit_status", 0) or "signal" in r:
+            how = (f"was killed by signal {r['signal']}" if "signal" in r
+                   else f"exited with status {r['exit_status']}")
+            if r.get("profiled"):
+                note(f"profiled run {r['name']} {how}; the timed runs are "
+                     "reported without a profile")
+            else:
+                note(f"run {r['name']} {how}; later runs did not happen")
+        path = os.path.join(d, r["stats"])
+        r["summaries"] = [s for s in load_jsonl(path) if s.get("type") == "summary"]
+        if not r["summaries"] and r.get("exit_status") == 0:
+            (no_summary if os.path.exists(path) else no_file).append(r["name"])
+    if no_file:
+        note(f"no DTO stats from {runs_list(no_file)}: is {header.get('library')} "
+             "new enough to write JSON stats, and is the program dynamically linked "
+             "and not setuid?")
+    if no_summary:
+        note(f"DTO stats from {runs_list(no_summary)} have no summary: did the "
+             "program end without running exit handlers (_exit, or a signal)?")
+    return header, runs
+
+
+def runs_list(names):
+    return ("run " if len(names) == 1 else "runs ") + ", ".join(names)
+
+
+# ---- Amdahl ----------------------------------------------------------------
+
+def mode_summary(runs):
+    timed = [r for r in runs if r.get("exit_status") == 0 and r["summaries"]]
+    if not timed:
+        return None
+    # The CPU time, the mem* time and the histogram all come from one run,
+    # the one with the median CPU time, so that f and "outside mem* calls"
+    # compare like with like: a mean mem* time against a median CPU time
+    # lets one preempted run push f past 100%. The wall time is the median.
+    by_cpu = sorted(timed, key=lambda r: r["user_s"] + r["sys_s"])
+    rep = by_cpu[(len(by_cpu) - 1) // 2]
+    st = RunStats()
+    st.add_run(rep["summaries"], 1.0)
+    walls = [r["wall_s"] for r in timed]
+    return {
+        "runs": len(timed),
+        "wall_s": statistics.median(walls),
+        "wall_range": (min(walls), max(walls)),
+        "cpu_s": rep["user_s"] + rep["sys_s"],
+        "mem_s": st.total("ns") / 1e9,
+        "bytes": st.total("bytes"),
+        "stats": st,
+    }
+
+
+def ratio(a, b):
+    return a / b if b else None
+
+
+def per_byte_speedup(ns_cpu, bytes_cpu, ns_dsa, bytes_dsa):
+    """Speedup of time per byte, so that runs that did different amounts
+    of work (a benchmark that runs for a fixed time) still compare."""
+    if not (ns_cpu and bytes_cpu and ns_dsa and bytes_dsa):
+        return None
+    return (ns_cpu / bytes_cpu) / (ns_dsa / bytes_dsa)
+
+
+def analyze(header, runs, top):
+    res = {"command": header.get("command", []), "library": header.get("library"),
+           "host": header.get("host"), "env": header.get("env", {})}
+    m = {mode: mode_summary([r for r in runs if r["mode"] == mode
+                             and not r.get("profiled")]) for mode in MODES}
+    res["modes"] = {k: (None if v is None else {x: v[x] for x in v if x != "stats"})
+                    for k, v in m.items()}
+    c, d = m["cpu"], m["dsa"]
+    if c is None or d is None:
+        note("need a successful CPU-only run and a successful DSA run, with stats, "
+             "to compare")
+        return res, m
+    cs, ds = c["stats"], d["stats"]
+
+    # how the DSA run used DSA
+    cfg = ds.configs[-1] if ds.configs else {}
+    res["dsa_config"] = cfg
+    if ds.total("calls", ("dsa", "dsa_failed")) == 0:
+        if any(x.get("stdc_only") for x in ds.configs):
+            note("no call went to DSA in the DSA run: DTO found no usable work queue "
+                 "and used the CPU (are the WQs enabled, and is the program allowed to "
+                 "open them? try sudo)")
+        else:
+            note(f"no call went to DSA in the DSA run: every call was smaller than "
+                 f"min_bytes ({cfg.get('min_bytes', '?')}) or its operation was not "
+                 "offloaded")
+    if c["bytes"] and d["bytes"] and abs(d["bytes"] / c["bytes"] - 1) > 0.02:
+        note(f"the runs did different amounts of mem* work ({fmt_bytes(c['bytes'])} "
+             f"CPU-only, {fmt_bytes(d['bytes'])} with DSA), so the wall-time speedup "
+             "compares unlike runs; if the program runs for a fixed time, compare "
+             f"mem* throughput: {fmt_bytes(c['bytes'] / c['wall_s'])}/s CPU-only, "
+             f"{fmt_bytes(d['bytes'] / d['wall_s'])}/s with DSA")
+
+    f = ratio(c["mem_s"], c["cpu_s"])
+    if f is not None and f > 1:
+        note(f"the CPU-only run's mem* calls took {f:.0%} of its CPU time: threads "
+             "were preempted or descheduled during calls, so f is taken as 100%")
+        f = 1.0
+    s = per_byte_speedup(c["mem_s"], c["bytes"], d["mem_s"], d["bytes"])
+    amdahl = {"f": f, "s": s, "predicted": None,
+              "limit": None if f is None else (1 / (1 - f) if f < 1 else None)}
+    if f is not None and s:
+        amdahl["predicted"] = 1 / ((1 - f) + f / s)
+    res["amdahl"] = amdahl
+    res["measured"] = {"wall": ratio(c["wall_s"], d["wall_s"]),
+                       "cpu": ratio(c["cpu_s"], d["cpu_s"])}
+    res["outside_mem_s"] = {"cpu": c["cpu_s"] - c["mem_s"],
+                            "dsa": d["cpu_s"] - d["mem_s"]}
+
+    ops = {}
+    for op in OPS:
+        calls, nbytes = cs.op_total(op, "calls"), cs.op_total(op, "bytes")
+        failed = cs.op_total(op, "calls", ("dsa_failed",))
+        if not (calls or ds.op_total(op, "calls")):
+            continue
+        dbytes = ds.op_total(op, "bytes")
+        ops[op] = {
+            # a call DSA left partly done is counted twice: dsa_failed, then cpu
+            "calls": calls - failed,
+            "bytes": nbytes,
+            "cpu_only_s": cs.op_total(op, "ns") / 1e9,
+            "with_dsa_s": ds.op_total(op, "ns") / 1e9,
+            "speedup": per_byte_speedup(cs.op_total(op, "ns"), nbytes,
+                                        ds.op_total(op, "ns"), dbytes),
+            "on_dsa": ratio(ds.op_total(op, "bytes", ("dsa",)), dbytes),
+            "share": ratio(cs.op_total(op, "ns") / 1e9, c["cpu_s"]),
+            "dsa_paths": {p: ds.ops[op][p] for p in PATHS},
+        }
+    res["ops"] = ops
+    res["dsa_failures"] = ds.fails
+
+    buckets = []
+    for key in sorted(set(cs.hist) | set(ds.hist)):
+        ch, dh = cs.hist.get(key, zero_ops()), ds.hist.get(key, zero_ops())
+        tot = lambda h, fld, paths=PATHS: sum(h[o][p][fld] for o in OPS for p in paths)
+        ccalls = tot(ch, "calls") - tot(ch, "calls", ("dsa_failed",))
+        dcalls = tot(dh, "calls") - tot(dh, "calls", ("dsa_failed",))
+        buckets.append({
+            "min": key[0], "max": key[1], "calls": ccalls,
+            "cpu_only_us": ratio(tot(ch, "ns"), ccalls * 1e3),
+            "with_dsa_us": ratio(tot(dh, "ns"), dcalls * 1e3),
+            "on_dsa": ratio(tot(dh, "calls", ("dsa",)), dcalls),
+            "cpu_only_s": tot(ch, "ns") / 1e9,
+        })
+    size_notes(buckets)
+    buckets.sort(key=lambda b: -b["cpu_only_s"])
+    res["buckets"] = sorted(buckets[:top], key=lambda b: b["min"])
+    return res, m
+
+
+def size_notes(buckets):
+    """Point out the sizes where DSA was slower than the CPU."""
+    compared = [b for b in buckets
+                if b["on_dsa"] and b["cpu_only_us"] and b["with_dsa_us"]]
+    # within 5% counts as neither
+    lost = [b for b in compared if b["with_dsa_us"] > b["cpu_only_us"] * 1.05]
+    won = [b for b in compared if b["cpu_only_us"] > b["with_dsa_us"] * 1.05]
+    if not lost:
+        return
+    if not won:
+        note("mem* calls that went to DSA were slower than on the CPU at every "
+             "size this program used")
+    elif max(b["min"] for b in lost) < min(b["min"] for b in won):
+        cross = min(b["min"] for b in won)
+        note(f"DSA was slower than the CPU for calls under {fmt_size(cross)} and "
+             f"faster from there up: DTO_MIN_BYTES={cross} (with "
+             "DTO_AUTO_ADJUST_KNOBS=0) keeps the smaller ones on the CPU")
+    else:
+        note("DSA was slower than the CPU for some sizes and faster for others; "
+             "see the per-size table")
+
+
+# ---- perf ------------------------------------------------------------------
+
+CATEGORIES = ("memcpy/memmove", "memset", "memcmp", "CRC", "kernel copy/clear",
+              "DTO library", "libc, unknown function", "other user code",
+              "other kernel code")
+MEM_CATEGORIES = CATEGORIES[:3]
+USER_PATTERNS = (
+    ("memcmp", re.compile(r"mem(cmp|cmpeq)|bcmp")),
+    ("memset", re.compile(r"memset|bzero")),
+    ("memcpy/memmove", re.compile(r"mem(cpy|move|pcpy)")),
+    ("CRC", re.compile(r"crc", re.I)),
+)
+KERNEL_COPY = re.compile(r"copy_(user|to_user|from_user|page|mc)|rep_movs|rep_stos|"
+                         r"clear_(page|user)|^_*mem(cpy|move|set)")
+
+
+def is_libc(path):
+    """libc.so.6, or libc-2.28.so on older glibc"""
+    return re.match(r"libc(\.so|-[0-9.]+\.so)", os.path.basename(path)) is not None
+
+
+def read_elf(path):
+    """Build ID, PT_LOAD segments and dynamic function addresses of a 64-bit
+    little-endian ELF file, or None."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    if data[:6] != b"\x7fELF\x02\x01":
+        return None
+    phoff, shoff = struct.unpack_from("<QQ", data, 0x20)
+    phentsize, phnum, shentsize, shnum = struct.unpack_from("<HHHH", data, 0x36)
+    loads, build_id, funcs = [], None, []
+    for i in range(phnum):
+        p_type, _, p_off, p_vaddr, _, p_filesz, _, _ = struct.unpack_from(
+            "<IIQQQQQQ", data, phoff + i * phentsize)
+        if p_type == 1:
+            loads.append((p_off, p_vaddr, p_filesz))
+        elif p_type == 4:
+            off, end = p_off, p_off + p_filesz
+            while off + 12 <= end:
+                namesz, descsz, ntype = struct.unpack_from("<III", data, off)
+                desc = off + 12 + ((namesz + 3) & ~3)
+                if ntype == 3 and data[off + 12:off + 15] == b"GNU":
+                    build_id = data[desc:desc + descsz].hex()
+                off = desc + ((descsz + 3) & ~3)
+    for i in range(shnum):
+        _, sh_type, _, _, sh_off, sh_size, _, _, _, _ = struct.unpack_from(
+            "<IIQQQQIIQQ", data, shoff + i * shentsize)
+        if sh_type == 11:       # SHT_DYNSYM
+            for j in range(sh_size // 24):
+                _, info, _, _, value, _ = struct.unpack_from("<IBBHQQ", data, sh_off + j * 24)
+                if (info & 0xf) in (2, 10) and value:   # STT_FUNC, STT_GNU_IFUNC
+                    funcs.append(value)
+    return {"build_id": build_id, "loads": loads, "funcs": funcs}
+
+
+class LibcLocator:
+    """Names the mem* functions in a profile of a libc without a symbol table.
+
+    Their implementations are internal (__memmove_avx512_unaligned_erms and
+    so on), so perf shows only an address. This process's libc says, through
+    dlsym, which implementation of memcpy, memset, ... this CPU uses; a sample
+    from that address up to the next function known is counted as that
+    function. Only used for a profile of the same libc file (same build ID),
+    taken on this machine: another CPU may pick other implementations."""
+
+    COPY = ("memcpy", "memmove", "mempcpy", "__memcpy_chk", "__memmove_chk",
+            "__mempcpy_chk", "wmemcpy", "wmemmove")
+    FILL = ("memset", "__memset_chk", "bzero", "wmemset", "__wmemset_chk")
+    CMP = ("memcmp", "bcmp", "__memcmpeq", "wmemcmp")
+    # other string functions, only as ends of the ones above
+    OTHER = ("strlen", "strnlen", "strchr", "strchrnul", "strrchr", "strcmp", "strncmp",
+             "strcpy", "stpcpy", "strncpy", "stpncpy", "strcat", "strncat", "memchr",
+             "memrchr", "rawmemchr", "strcasecmp", "strncasecmp", "strcspn", "strspn",
+             "strpbrk", "strstr", "wcslen", "wcsnlen", "wcschr", "wcsrchr", "wcscmp",
+             "wcsncmp", "wcscpy", "wmemchr")
+    MAX_FUNC = 64 << 10
+
+    def __init__(self):
+        self.ok = False
+        path = base = None
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+            with open("/proc/self/maps") as f:
+                for line in f:
+                    fld = line.split()
+                    if len(fld) > 5 and is_libc(fld[5]) and int(fld[2], 16) == 0:
+                        path, base = fld[5], int(fld[0].split("-")[0], 16)
+                        break
+        except (OSError, ValueError):
+            return
+        elf = read_elf(path) if path else None
+        if not elf or not elf["build_id"]:
+            return
+        self.build_id, self.loads = elf["build_id"], elf["loads"]
+        starts = {a: None for a in elf["funcs"]}
+        for cat, names in (("memcpy/memmove", self.COPY), ("memset", self.FILL),
+                           ("memcmp", self.CMP), (None, self.OTHER)):
+            for name in names:
+                try:
+                    addr = ctypes.cast(getattr(libc, name), ctypes.c_void_p).value
+                except AttributeError:
+                    continue
+                starts[addr - base] = cat
+        self.addrs = sorted(starts)
+        self.cats = [starts[a] for a in self.addrs]
+        self.ok = True
+
+    def category(self, offset):
+        """Category of a sample at this file offset in libc, or None."""
+        for p_off, p_vaddr, size in self.loads:
+            if p_off <= offset < p_off + size:
+                addr = offset - p_off + p_vaddr
+                break
+        else:
+            return None
+        i = bisect.bisect_right(self.addrs, addr) - 1
+        if i < 0 or addr - self.addrs[i] > self.MAX_FUNC:
+            return None
+        return self.cats[i]
+
+
+def perf_lines(perf, args):
+    try:
+        p = subprocess.run([perf] + args, capture_output=True, text=True,
+                           errors="replace")
+    except OSError as e:
+        note(f"cannot run {perf}: {e}")
+        return None
+    if p.returncode:
+        note(f"{perf} {args[0]} failed: {p.stderr.strip()[:200]}")
+        return None
+    return p.stdout.splitlines()
+
+
+def profile(perf, data, locator):
+    """Share of samples in each category for a perf.data file, or None."""
+    libc_id = None
+    if locator.ok:
+        for line in perf_lines(perf, ["buildid-list", "-f", "-i", data]) or []:
+            fld = line.split(None, 1)
+            if len(fld) == 2 and is_libc(fld[1]):
+                libc_id = fld[0]
+    use_locator = locator.ok and libc_id == locator.build_id
+
+    lines = perf_lines(perf, ["report", "-f", "-i", data, "--stdio", "-q",
+                              "--no-children", "--sort", "dso,sym",
+                              "-F", "period,dso,sym", "-t", "|"])
+    if lines is None:
+        return None
+    shares, unknown_libc = classify(lines, locator if use_locator else None)
+    if unknown_libc > 0.05 and not use_locator:
+        note("the profiles' libc has no symbol table, so libc functions show as "
+             "addresses; run the report on the machine that ran the program (to "
+             "place them by address) or install libc debug symbols (libc6-dbg, "
+             "glibc-debuginfo)")
+    return shares
+
+
+def classify(lines, locator=None):
+    """Shares of the samples in each category, from "perf report" lines of
+    period|dso|sym, and the share in libc that could not be placed."""
+    totals = dict.fromkeys(CATEGORIES, 0)
+    unknown_libc = 0
+    for line in lines:
+        fld = line.split("|", 2)
+        if len(fld) != 3:
+            continue
+        try:
+            period = int(fld[0])
+        except ValueError:
+            continue
+        dso, sym = fld[1].strip(), fld[2].strip()
+        m = re.match(r"\[(.)\]\s*(.*)", sym)
+        kernel, name = (m.group(1) == "k", m.group(2)) if m else (False, sym)
+        if kernel:
+            cat = "kernel copy/clear" if KERNEL_COPY.search(name) else "other kernel code"
+        elif dso.startswith("libdto"):
+            cat = "DTO library"
+        else:
+            cat = next((c for c, pat in USER_PATTERNS if pat.search(name)), None)
+            if cat is None and is_libc(dso) and name.startswith("0x"):
+                cat = locator.category(int(name, 16)) if locator else None
+                if cat is None:
+                    cat = "libc, unknown function"
+                    unknown_libc += period
+            cat = cat or "other user code"
+        totals[cat] += period
+    total = sum(totals.values())
+    if not total:
+        return None, 0
+    return {k: v / total for k, v in totals.items()}, unknown_libc / total
+
+
+def profiles(d, header, runs, perf):
+    perf = perf or header.get("perf") or "perf"
+    locator = LibcLocator()
+    out = {}
+    for r in runs:
+        if r.get("profiled") and r.get("perf_data") and r.get("exit_status") == 0:
+            shares = profile(perf, os.path.join(d, r["perf_data"]), locator)
+            if shares:
+                out[r["mode"]] = shares
+    return out
+
+
+def profile_notes(res, prof):
+    cpu = prof.get("cpu")
+    if not cpu:
+        return
+    seen = res.get("amdahl", {}).get("f")
+    mem = sum(cpu[c] for c in MEM_CATEGORIES)
+    if seen is not None and mem - seen > 0.05:
+        note(f"perf puts {mem:.0%} of the CPU-only run in memcpy/memmove/memset/memcmp, "
+             f"DTO saw {seen:.0%}: the rest is calls DTO doesn't intercept, such as "
+             "calls inside libc or other libraries, __memcpy_chk and friends from "
+             "_FORTIFY_SOURCE, or a statically linked libc")
+    if cpu["CRC"] > 0.02:
+        note(f"{cpu['CRC']:.0%} of the CPU-only run is CRC code: DSA can compute "
+             "CRC32C, but DTO doesn't intercept CRC functions, so offloading it needs "
+             "an explicit call")
+    if cpu["kernel copy/clear"] > 0.02:
+        note(f"{cpu['kernel copy/clear']:.0%} of the CPU-only run is the kernel "
+             "copying or clearing memory (read/write, page faults), which DTO doesn't "
+             "offload")
+
+
+# ---- output ----------------------------------------------------------------
+
+def fmt_bytes(n):
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024 or unit == "TiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def fmt_size(n):
+    if n is None:
+        return ""
+    for unit in ("", "K", "M", "G"):
+        if n < 1024 or unit == "G":
+            return f"{n:g}{unit}"
+        n /= 1024
+
+
+def fmt_count(n):
+    for unit, div in (("G", 1e9), ("M", 1e6), ("k", 1e3)):
+        if n >= div:
+            return f"{n / div:.2f}{unit}"
+    return f"{n:.0f}"
+
+
+def fmt_s(s):
+    if s is None:
+        return "-"
+    if abs(s) >= 1:
+        return f"{s:.2f} s"
+    if abs(s) >= 1e-3:
+        return f"{s * 1e3:.2f} ms"
+    return f"{s * 1e6:.1f} us"
+
+
+def fmt_range(r):
+    lo, hi = fmt_s(r[0]).split(), fmt_s(r[1]).split()
+    if lo[1] == hi[1]:
+        return f"{lo[0]}-{hi[0]} {hi[1]}"
+    return f"{fmt_s(r[0])}-{fmt_s(r[1])}"
+
+
+def fmt_x(x):
+    return "-" if x is None else f"{x:.2f}x"
+
+
+def fmt_pct(x):
+    return "-" if x is None else f"{x:.1%}"
+
+
+def print_report(d, header, res, prof):
+    print(f"DTO stats run: {d}")
+    print(f"  command: {' '.join(res['command'])}")
+    print(f"  library: {res['library']}   host: {res['host']}")
+    env = " ".join(f"{k}={v}" for k, v in sorted(res["env"].items())
+                   if k not in ("DTO_COLLECT_STATS", "DTO_STATS_FORMAT"))
+    if env:
+        print(f"  settings: {env}")
+    modes = res["modes"]
+    if modes.get("cpu") and modes.get("dsa"):
+        print(f"  timed runs: {modes['cpu']['runs']} CPU-only, {modes['dsa']['runs']} "
+              f"with DSA (medians)")
+    cfg = res.get("dsa_config")
+    if cfg:
+        print(f"  DTO in the DSA run: {cfg.get('wqs', '?')} WQs, wait "
+              f"{cfg.get('wait_method', '?')}, min_bytes {cfg.get('min_bytes', '?')}, "
+              f"cpu_size_fraction {cfg.get('cpu_size_fraction', '?')}"
+              f"{' (auto-adjusted)' if cfg.get('auto_adjust') else ''}")
+    print()
+
+    if "amdahl" in res:
+        c, dm = modes["cpu"], modes["dsa"]
+        out = res["outside_mem_s"]
+        print(f"  {'':28}{'CPU only':>15}{'with DSA':>15}{'speedup':>10}")
+        print(f"  {'wall time':28}{fmt_s(c['wall_s']):>15}{fmt_s(dm['wall_s']):>15}"
+              f"{fmt_x(res['measured']['wall']):>10}")
+        print(f"  {'CPU time (user+sys)':28}{fmt_s(c['cpu_s']):>15}{fmt_s(dm['cpu_s']):>15}"
+              f"{fmt_x(res['measured']['cpu']):>10}")
+        print(f"  {'  in mem* calls':28}{fmt_s(c['mem_s']):>15}{fmt_s(dm['mem_s']):>15}"
+              f"{fmt_x(res['amdahl']['s']):>10}")
+        print(f"  {'  outside mem* calls':28}{fmt_s(out['cpu']):>15}{fmt_s(out['dsa']):>15}"
+              f"{fmt_x(ratio(out['cpu'], out['dsa']) if out['dsa'] > 0 else None):>10}")
+        if c["runs"] > 1 or dm["runs"] > 1:
+            print(f"  {'wall time, min-max':28}{fmt_range(c['wall_range']):>15}"
+                  f"{fmt_range(dm['wall_range']):>15}")
+        a = res["amdahl"]
+        print()
+        print("  Amdahl's law")
+        print(f"    f, share of CPU time in mem* calls (CPU-only)  {fmt_pct(a['f']):>8}")
+        print(f"    s, mem* speedup with DSA (time per byte)       {fmt_x(a['s']):>8}")
+        print(f"    predicted speedup, 1 / ((1 - f) + f / s)       {fmt_x(a['predicted']):>8}")
+        print(f"    measured speedup, wall time                    "
+              f"{fmt_x(res['measured']['wall']):>8}")
+        print(f"    limit if mem* took no time, 1 / (1 - f)        {fmt_x(a['limit']):>8}")
+
+    if res.get("ops"):
+        print()
+        print(f"  {'per operation':16}{'calls':>9}{'bytes':>12}{'avg size':>11}"
+              f"{'CPU only':>11}{'with DSA':>11}{'speedup':>9}{'on DSA':>8}{'f':>8}")
+        for op, o in res["ops"].items():
+            print(f"  {op:16}{fmt_count(o['calls']):>9}{fmt_bytes(o['bytes']):>12}"
+                  f"{fmt_bytes(o['bytes'] / o['calls']) if o['calls'] else '-':>11}"
+                  f"{fmt_s(o['cpu_only_s']):>11}{fmt_s(o['with_dsa_s']):>11}"
+                  f"{fmt_x(o['speedup']):>9}{fmt_pct(o['on_dsa']):>8}{fmt_pct(o['share']):>8}")
+        print("    (on DSA: share of the bytes in calls sent to DSA, of which the CPU "
+              "does cpu_size_fraction;")
+        print("     f: share of the CPU-only run's CPU time)")
+        fails = res.get("dsa_failures", {})
+        if any(fails.values()):
+            print(f"    calls DSA left to the CPU, per run: page fault "
+                  f"{fmt_count(fails['page_fault'])}, retry {fmt_count(fails['retry'])}, "
+                  f"other {fmt_count(fails['other'])}")
+
+    if res.get("buckets"):
+        print()
+        print(f"  {'by size (most time)':22}{'calls':>9}{'CPU only':>11}{'with DSA':>11}"
+              f"{'speedup':>9}{'on DSA':>8}")
+        for b in res["buckets"]:
+            # buckets are [min, max]; [min, max + 1) reads better
+            rng = f"{fmt_size(b['min'])}-{fmt_size(b['max'] + 1)}" if b["max"] else \
+                f">={fmt_size(b['min'])}"
+            us = lambda v: "-" if v is None else f"{v:.2f} us"
+            print(f"  {rng:22}{fmt_count(b['calls']):>9}{us(b['cpu_only_us']):>11}"
+                  f"{us(b['with_dsa_us']):>11}"
+                  f"{fmt_x(ratio(b['cpu_only_us'], b['with_dsa_us'])):>9}"
+                  f"{fmt_pct(b['on_dsa']):>8}")
+        print("    (average time per call; on DSA: share of calls sent to DSA)")
+
+    if prof:
+        print()
+        print(f"  {'profile (perf, % of CPU time)':34}"
+              + "".join(f"{('CPU only' if m == 'cpu' else 'with DSA'):>11}"
+                        for m in MODES if m in prof))
+        for cat in CATEGORIES:
+            if not any(prof[m][cat] >= 0.0005 for m in prof):
+                continue
+            print(f"    {cat:32}" + "".join(f"{prof[m][cat]:>11.1%}"
+                                             for m in MODES if m in prof))
+
+    if notes:
+        print()
+        for n in notes:
+            print(f"  note: {n}")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Summarize a dtoctl --stats-run: DSA speedup and Amdahl's law.")
+    ap.add_argument("dir", help="directory written by dtoctl --stats-run")
+    ap.add_argument("--json", action="store_true", help="print the results as JSON")
+    ap.add_argument("--perf", help="perf binary for reading the profiles "
+                    "(default: the one dtoctl ran)")
+    ap.add_argument("--top", type=int, default=8,
+                    help="size ranges to show, those with the most CPU-only time "
+                    "(default: 8)")
+    args = ap.parse_args()
+
+    header, runs = load_dir(args.dir)
+    res, _ = analyze(header, runs, args.top)
+    prof = profiles(args.dir, header, runs, args.perf)
+    profile_notes(res, prof)
+    if args.json:
+        res["profile"] = prof
+        res["notes"] = notes
+        json.dump(res, sys.stdout, indent=1)
+        print()
+    else:
+        print_report(args.dir, header, res, prof)
+
+
+if __name__ == "__main__":
+    main()

@@ -13,6 +13,8 @@ dtoctl [_options_] COMMAND [_command-options_]
 
 dtoctl \--dry-run [_options_] [COMMAND [_command-options_]]
 
+dtoctl \--stats-run[=_DIR_] [\--repeat=_N_] [\--perf[=_PERF_]] [_options_] COMMAND [_command-options_]
+
 
 DESCRIPTION
 ===========
@@ -160,13 +162,24 @@ Other toggles
 Statistics and logging
 ----------------------
 \--stats
-:   Enable stats collection.  For debugging/profiling only, as it slows down the
-    workload.  Sets **DTO_COLLECT_STATS=1**.  Default: off.
+:   Enable stats collection: calls, bytes and time for each operation, by
+    path (CPU, DSA, DSA failed) and by size.  Costs about 40 ns per call.
+    Sets **DTO_COLLECT_STATS=1**.  Default: off.
 
 \--stats-file=_PATH_
-:   Write the stats histogram to _PATH_ instead of standard output.  Implies
-    `--stats`, since DTO ignores the file otherwise.  Sets **DTO_STATS_FILE**
-    and **DTO_COLLECT_STATS=1**.  Default: standard output.
+:   Write the stats to _PATH_ instead of standard output; each `%p` in _PATH_
+    becomes the process ID.  The file is appended to.  Implies `--stats`,
+    since DTO ignores the file otherwise.  Sets **DTO_STATS_FILE** and
+    **DTO_COLLECT_STATS=1**.  Default: standard output.
+
+\--stats-format=_FORMAT_
+:   _text_ for tables, or _json_ for JSON Lines (one record per line).
+    Implies `--stats`.  Sets **DTO_STATS_FORMAT**.  Default: _text_.
+
+\--stats-interval=_MS_
+:   Also write the stats for every _MS_ milliseconds, from a background
+    thread, as well as the summary at exit.  Implies `--stats`.  Sets
+    **DTO_STATS_INTERVAL_MS**.  Default: summary only.
 
 \--log-file=_PATH_
 :   Redirect DTO output to _PATH_._program_._pid_, one file per process.
@@ -175,6 +188,28 @@ Statistics and logging
 \--log-level=_LEVEL_
 :   Verbosity of DTO logging: _0_, _1_, or _2_.  Sets **DTO_LOG_LEVEL**.
     Default: _0_.
+
+Stats run
+---------
+\--stats-run[=_DIR_]
+:   Measure how much DSA speeds `COMMAND` up.  Run it CPU-only
+    (**DTO_USESTDC_CALLS=1**), then with DSA (**DTO_USESTDC_CALLS=0**),
+    collecting JSON stats from each run into _DIR_, then summarize them with
+    **dto-stats-report** (see STATS RUN).  _DIR_ must be new or empty; the
+    default is a new `dto-stats-<date>-<time>` in the current directory.
+    Give _DIR_ with `=`: `--stats-run=out`.  The other options apply to every
+    run; `--stdc-only`, `--stats-file` and `--stats-format` cannot be used,
+    since each run sets them.
+
+\--repeat=_N_
+:   With `--stats-run`, run each way _N_ times, alternating; the report takes
+    the median wall time, and the CPU and mem* times of the run with the
+    median CPU time.  Default: 1.
+
+\--perf[=_PERF_]
+:   With `--stats-run`, also run each way once more under
+    `PERF record -e cpu-clock`, to show where the CPU time went.  _PERF_ is
+    the **perf** to run.  Default: **perf** from **PATH**.
 
 -?, \--help
 :   Print help message and list of options with description.
@@ -204,6 +239,51 @@ status is that of `COMMAND`.  Otherwise:
 :   `COMMAND` was not found.
 
 `--dry-run`, `--help`, and `--version` exit with 0.
+
+With `--stats-run`, a run that fails stops the rest, and **dtoctl** exits with
+its status (128 + the signal number if it was killed); otherwise the exit
+status is that of **dto-stats-report**.
+
+
+STATS RUN
+=========
+`--stats-run` answers two questions: how much faster is `COMMAND` with DSA,
+and how much faster could it be?
+
+Each run's DTO stats give the time spent in the intercepted calls, and
+**dtoctl** records each run's wall time and CPU time (user + system, for
+`COMMAND` and all its children).  **dto-stats-report** then works out:
+
+f
+:   the share of the CPU-only run's CPU time spent in mem\* calls;
+
+s
+:   how much faster the mem\* calls were with DSA, per byte;
+
+predicted speedup
+:   by Amdahl's law, 1 / ((1 - f) + f / s), set against the measured
+    speedup in wall time;
+
+limit
+:   1 / (1 - f), the speedup if the mem\* calls took no time at all.
+
+It also lists each operation and the sizes with the most time, CPU-only and
+with DSA, and notes where DSA lost, where the runs differed, and why no call
+may have reached DSA.  With `--perf` it divides each run's CPU time into
+copies, memset, memcmp, CRC, kernel copies, DTO itself and other code, from
+the profile, which also catches mem\* calls DTO cannot intercept.
+
+Amdahl's estimate assumes `COMMAND` is busy on the CPU; one that waits for
+I/O or for other threads gains less in wall time.  A benchmark that runs for
+a fixed time does more work when faster: the report says so when the runs
+copied different amounts, and compares speed per byte.
+
+The directory holds `runs.jsonl` (the command, settings, and each run's times
+and exit status), `<run>.jsonl` (DTO's stats for each run, from every process
+it started), and with `--perf`, `<mode>-perf.data`.  Run
+**dto-stats-report** _DIR_ again at any time, with `--json` for the numbers
+as JSON.  DTO writes the stats files readable by their owner only, so a run
+made with **sudo** needs **sudo** to report on.
 
 
 NOTES
@@ -255,6 +335,10 @@ stats into a file:
     $ dtoctl -l ./libdto.so.1.0 -q "wq0.0;wq2.0;wq4.0;wq6.0" \
           --stats-file=/tmp/dto-stats.txt ./prog
 
+Measure the speedup from DSA, three runs each way, then profile:
+
+    $ sudo dtoctl --stats-run=prog-stats --repeat=3 --perf ./prog
+
 Check what would run, ignoring anything exported in the shell:
 
     $ dtoctl --dry-run -i -w umwait -b 16K ./prog
@@ -267,4 +351,4 @@ Check what would run, ignoring anything exported in the shell:
 
 SEE ALSO
 ========
-**ld.so**(8), **accel-config**(1)
+**ld.so**(8), **accel-config**(1), **perf-record**(1)

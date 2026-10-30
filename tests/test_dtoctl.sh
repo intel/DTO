@@ -54,14 +54,16 @@ status() {
 run "$DTOCTL" -l "$LIB" --dry-run -w umwait -b 64K -c 0.25 -n 2 -q 'wq0.0;wq2.0' \
     --umwait-delay 5000 --overlapping-memmove=dsa --no-memcpy --no-memmove \
     --no-memset --no-memcmp --no-cache-control --no-auto-adjust --stdc-only \
-    --log-file=/tmp/dto.log --log-level 1 --stats-file=/tmp/dto.stats prog 'a b'
+    --log-file=/tmp/dto.log --log-level 1 --stats-file=/tmp/dto.stats \
+    --stats-format json --stats-interval 10 prog 'a b'
 status "dry-run succeeds" 0
 for v in DTO_WAIT_METHOD=umwait DTO_MIN_BYTES=65536 DTO_CPU_SIZE_FRACTION=0.25 \
          DTO_IS_NUMA_AWARE=2 "DTO_WQ_LIST='wq0.0;wq2.0'" DTO_UMWAIT_DELAY=5000 \
          DTO_OVERLAPPING_MEMMOVE_ACTION=1 DTO_DSA_MEMCPY=0 DTO_DSA_MEMMOVE=0 \
          DTO_DSA_MEMSET=0 DTO_DSA_MEMCMP=0 DTO_DSA_CC=0 DTO_AUTO_ADJUST_KNOBS=0 \
          DTO_USESTDC_CALLS=1 DTO_LOG_FILE=/tmp/dto.log DTO_LOG_LEVEL=1 \
-         DTO_STATS_FILE=/tmp/dto.stats DTO_COLLECT_STATS=1; do
+         DTO_STATS_FILE=/tmp/dto.stats DTO_STATS_FORMAT=json DTO_STATS_INTERVAL_MS=10 \
+         DTO_COLLECT_STATS=1; do
     has "option sets $v" "^$v  # option\$"
 done
 has "dry-run shows the library" "^library: $LIB (--library)\$"
@@ -111,7 +113,10 @@ has "another libdto in LD_PRELOAD is dropped" "dropping '$TMP/old/libdto.so.1'"
 
 # --- invalid values are rejected ---
 for bad in "-w bogus" "-b 64Q" "-b abc" "-b -1" "-c 1.5" "-c nan" "-n 3" \
-           "--log-level x" "--umwait-delay 0" "--overlapping-memmove=gpu"; do
+           "--log-level x" "--umwait-delay 0" "--overlapping-memmove=gpu" \
+           "--stats-format xml" "--stats-interval 0" "--repeat 2" "--perf" \
+           "--stats-run --stdc-only" "--stats-run --stats-file=x" "--stats-run=a%pb" \
+           "--stats-run --repeat 0"; do
     run "$DTOCTL" -l "$LIB" $bad true
     status "rejects $bad" 64
 done
@@ -138,6 +143,56 @@ status "program's exit status is returned" 7
 
 run "$DTOCTL" --version
 has "--version" "^dtoctl (DTO) "
+
+# --- stats run ---
+run "$DTOCTL" -l "$LIB" --dry-run --stats-run=out --repeat 2 --perf=/usr/bin/perf prog 'a b'
+status "stats run dry-run succeeds" 0
+has "stats run collects stats" "^DTO_COLLECT_STATS=1  # option\$"
+has "stats run collects JSON" "^DTO_STATS_FORMAT=json  # option\$"
+has "first run is CPU-only" \
+    "^run cpu-1: DTO_USESTDC_CALLS=1 DTO_STATS_FILE=out/cpu-1.jsonl prog 'a b'\$"
+has "second run uses DSA" \
+    "^run dsa-1: DTO_USESTDC_CALLS=0 DTO_STATS_FILE=out/dsa-1.jsonl prog 'a b'\$"
+has "--repeat 2 runs each way twice" "^run dsa-2: "
+lacks "--repeat 2 stops at two" "^run cpu-3: "
+has "profiled run goes through perf and dtoctl" \
+    "^run cpu-perf: DTO_USESTDC_CALLS=1 DTO_STATS_FILE=out/cpu-perf.jsonl /usr/bin/perf record .* -o out/cpu-perf.data -- [^ ]*dtoctl -l $LIB -- prog 'a b'\$"
+has "the report comes last" "^report: dto-stats-report out\$"
+
+run "$DTOCTL" -l "$LIB" --dry-run --stats-run
+status "--stats-run needs a program, even with --dry-run" 64
+
+# dash leaves with _exit(), skipping DTO's summary, so end in a program that exits
+run "$DTOCTL" -l "$LIB" --stats-run="$TMP/run" --repeat 2 \
+    sh -c 'echo "env $DTO_USESTDC_CALLS ${DTO_STATS_FILE##*/} $DTO_STATS_FORMAT"; exec true'
+if command -v python3 >/dev/null; then
+    status "stats run succeeds" 0
+else
+    status "stats run succeeds (the report needs python3)" 127
+fi
+has "CPU-only runs set DTO_USESTDC_CALLS=1" "^env 1 cpu-2.jsonl json\$"
+has "DSA runs set DTO_USESTDC_CALLS=0" "^env 0 dsa-2.jsonl json\$"
+if [ "$(grep -c '"type":"run".*"exit_status":0' "$TMP/run/runs.jsonl")" -eq 4 ] &&
+   grep -q '"type":"summary"' "$TMP/run/dsa-2.jsonl"; then
+    echo "PASS: runs.jsonl records each run, and each run's stats are saved"
+else
+    fail "runs.jsonl records each run, and each run's stats are saved"
+fi
+if command -v python3 >/dev/null; then
+    has "dto-stats-report summarizes the runs" "^DTO stats run: $TMP/run\$"
+fi
+
+run "$DTOCTL" -l "$LIB" --stats-run="$TMP/run" true
+status "a directory with results in it is refused" 125
+
+run "$DTOCTL" -l "$LIB" --stats-run="$TMP/fail" sh -c 'exit 3'
+status "a failing run ends the stats run with its status" 3
+has "the failing run is named" "run cpu-1 exited with status 3; stopping"
+if [ -e "$TMP/fail/dsa-1.jsonl" ]; then
+    fail "no runs after a failure"
+else
+    echo "PASS: no runs after a failure"
+fi
 
 # --- libdto applies the settings (DSA is optional) ---
 run "$DTOCTL" -l "$LIB" --log-level 2 -w yield -b 8K -c 0.5 --no-auto-adjust true

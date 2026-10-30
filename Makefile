@@ -16,7 +16,7 @@ MANDIR ?= /usr/share/man
 DTO_VERSION := $(shell grep -o 'DTO VERSION [0-9.]*' CMakeLists.txt | cut -d' ' -f3)
 
 libdto: dto.c
-	gcc -shared -fPIC -Wl,-soname,libdto.so dto.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -DDTO_ACCEL_CONFIG_SUPPORT -DDTO_NUMA_SUPPORT -o libdto.so.1.0 -laccel-config -ldl -lnuma -mwaitpkg
+	gcc -shared -fPIC -Wl,-soname,libdto.so dto.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -DDTO_ACCEL_CONFIG_SUPPORT -DDTO_NUMA_SUPPORT -o libdto.so.1.0 -laccel-config -ldl -lnuma -lpthread -mwaitpkg
 
 libdto_nostats: dto.c
 	gcc -shared -fPIC -Wl,-soname,libdto.so dto.c $(DML_LIB_CXX) -DDTO_ACCEL_CONFIG_SUPPORT -DDTO_NUMA_SUPPORT -o libdto.so.1.0 -laccel-config -ldl -lnuma -mwaitpkg
@@ -43,6 +43,7 @@ install: dtoctl install-man
 	ln -sf /usr/lib64/libdto.so.1.0 /usr/lib64/libdto.so.1
 	ln -sf /usr/lib64/libdto.so.1.0 /usr/lib64/libdto.so
 	cp dtoctl /usr/bin/
+	cp dto-stats-report /usr/bin/
 
 install-man: man
 	@if [ -f doc/dtoctl.1 ]; then \
