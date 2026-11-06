@@ -20,6 +20,7 @@
 #include "dto.h"
 #include <x86intrin.h>
 #include <sched.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -93,6 +94,9 @@ struct dto_wq {
 	int wq_fd;
 	void *wq_portal;
 	bool wq_mmapped;
+	/* completion record of the write() submission probe; must outlive
+	 * test_write_syscall() because the device may complete the NOOP late */
+	struct dsa_completion_record probe_comp __attribute__((aligned(32)));
 };
 
 #ifdef DTO_NUMA_SUPPORT
@@ -929,27 +933,51 @@ static void cleanup_devices() {
 }
 #endif
 
+/* How long the write() probe waits for its NOOP to complete. The queue is
+ * shared: behind a burst of large descriptors from other processes a NOOP can
+ * take many milliseconds, far more than the few thousand pauses the probe
+ * used to spin. */
+#define DTO_PROBE_TIMEOUT_MS 1000
+
+/* Check that the work queue accepts descriptors through write() (the portal
+ * mmap is refused when idxd needs CAP_SYS_RAWIO for user submission).
+ *
+ * The completion record lives in the wq, not on the stack: the device owns
+ * the NOOP until it completes, and on a saturated queue that can be long
+ * after this function gave up waiting. With a stack record the late
+ * completion write landed in whatever frame had reused the slot (a stack
+ * protector canary, argv parsing state, a pointer), crashing the process
+ * at startup in ways that looked unrelated. */
 static bool test_write_syscall(struct dto_wq *wq)
 {
 	struct dsa_hw_desc desc = {0};
-	struct dsa_completion_record comp __attribute__((aligned(32)));
-	int retry = 0;
+	volatile uint8_t *status = &wq->probe_comp.status;
+	struct timespec t0, t;
+	unsigned int spins = 0;
 
 	desc.opcode = DSA_OPCODE_NOOP;
 	desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
-	comp.status = 0;
+	*status = 0;
 
-	desc.completion_addr = (unsigned long)&comp;
+	desc.completion_addr = (unsigned long)&wq->probe_comp;
 
-	if (dsa_submit(wq, &desc) == SUCCESS) {
-		while (comp.status == 0 && retry++ < 10000)
-			_mm_pause();
+	if (dsa_submit(wq, &desc) != SUCCESS)
+		return false;
 
-		if (comp.status == DSA_COMP_SUCCESS)
-			return true;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (*status == 0) {
+		_mm_pause();
+		if ((++spins & 1023) != 0)
+			continue;
+		clock_gettime(CLOCK_MONOTONIC, &t);
+		if ((t.tv_sec - t0.tv_sec) * 1000 + (t.tv_nsec - t0.tv_nsec) / 1000000 >= DTO_PROBE_TIMEOUT_MS) {
+			LOG_ERROR("DSA wq %s: write() probe did not complete in %d ms\n",
+				  wq->wq_path, DTO_PROBE_TIMEOUT_MS);
+			return false;
+		}
 	}
 
-	return false;
+	return *status == DSA_COMP_SUCCESS;
 }
 
 static int dsa_init_from_wq_list(char *wq_list)
